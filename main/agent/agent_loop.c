@@ -213,6 +213,7 @@ static void agent_loop_task(void *arg)
         char *final_text = NULL;
         int iteration = 0;
         bool sent_working_status = false;
+        char error_reason[128] = {0};
 
         while (iteration < SHRIMP_AGENT_MAX_TOOL_ITER) {
             /* Send "working" indicator before each API call */
@@ -221,7 +222,7 @@ static void agent_loop_task(void *arg)
                 shrimp_msg_t status = {0};
                 strncpy(status.channel, msg.channel, sizeof(status.channel) - 1);
                 strncpy(status.chat_id, msg.chat_id, sizeof(status.chat_id) - 1);
-                status.content = strdup("\xF0\x9F\x90\xB1shrimp is working...");
+                status.content = strdup("\xF0\x9F\xA6\x90 shrimp 正在处理...");
                 if (status.content) {
                     if (message_bus_push_outbound(&status) != ESP_OK) {
                         ESP_LOGW(TAG, "Outbound queue full, drop working status");
@@ -238,6 +239,7 @@ static void agent_loop_task(void *arg)
 
             if (err != ESP_OK) {
                 ESP_LOGE(TAG, "LLM call failed: %s", esp_err_to_name(err));
+                snprintf(error_reason, sizeof(error_reason), "LLM 调用失败 (%s)", esp_err_to_name(err));
                 break;
             }
 
@@ -245,6 +247,8 @@ static void agent_loop_task(void *arg)
                 /* Normal completion — save final text and break */
                 if (resp.text && resp.text_len > 0) {
                     final_text = strdup(resp.text);
+                } else {
+                    snprintf(error_reason, sizeof(error_reason), "未返回有效内容");
                 }
                 llm_response_free(&resp);
                 break;
@@ -267,6 +271,10 @@ static void agent_loop_task(void *arg)
 
             llm_response_free(&resp);
             iteration++;
+        }
+        
+        if (iteration >= SHRIMP_AGENT_MAX_TOOL_ITER && !error_reason[0]) {
+            snprintf(error_reason, sizeof(error_reason), "工具调用次数达到上限");
         }
 
         cJSON_Delete(messages);
@@ -304,7 +312,12 @@ static void agent_loop_task(void *arg)
             shrimp_msg_t out = {0};
             strncpy(out.channel, msg.channel, sizeof(out.channel) - 1);
             strncpy(out.chat_id, msg.chat_id, sizeof(out.chat_id) - 1);
-            out.content = strdup("Sorry, I encountered an error.");
+            
+            char err_msg[256];
+            snprintf(err_msg, sizeof(err_msg), "\xF0\x9F\xA6\x90 抱歉，处理出错了：%s", 
+                     error_reason[0] ? error_reason : "未知错误");
+            out.content = strdup(err_msg);
+            
             if (out.content) {
                 if (message_bus_push_outbound(&out) != ESP_OK) {
                     ESP_LOGW(TAG, "Outbound queue full, drop error response");

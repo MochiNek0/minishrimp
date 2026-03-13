@@ -105,6 +105,10 @@
 #define SHRIMP_MINIMAX_API_URL         "https://api.minimax.chat/v1/chat/completions"
 #define SHRIMP_YI_API_URL              "https://api.01.ai/v1/chat/completions"
 #define SHRIMP_DOUBAO_API_URL          "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+#define SHRIMP_HUNYUAN_API_URL         "https://api.hunyuan.cloud.tencent.com/v1/chat/completions"
+#define SHRIMP_BAICHUAN_API_URL        "https://api.baichuan-ai.com/v1/chat/completions"
+#define SHRIMP_QIANFAN_API_URL         "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/completions"
+#define SHRIMP_SPARK_API_URL           "https://spark-api-open.xf-yun.com/v1/chat/completions"
 #define SHRIMP_LLM_API_VERSION         "2023-06-01"
 #define SHRIMP_LLM_STREAM_BUF_SIZE     (32 * 1024)
 #define SHRIMP_LLM_LOG_VERBOSE_PAYLOAD 0

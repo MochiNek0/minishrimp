@@ -205,11 +205,7 @@ static bool provider_is_openai_compatible(void)
 
 static bool provider_requires_custom_url(void)
 {
-    return strcmp(s_provider, "custom") == 0 ||
-           strcmp(s_provider, "hunyuan") == 0 ||
-           strcmp(s_provider, "baichuan") == 0 ||
-           strcmp(s_provider, "qianfan") == 0 ||
-           strcmp(s_provider, "spark") == 0;
+    return strcmp(s_provider, "custom") == 0;
 }
 
 static bool provider_is_qwen(void)
@@ -235,6 +231,10 @@ static const char *provider_base_url(void)
     if (strcmp(s_provider, "minimax") == 0) return SHRIMP_MINIMAX_API_URL;
     if (strcmp(s_provider, "yi") == 0) return SHRIMP_YI_API_URL;
     if (strcmp(s_provider, "doubao") == 0) return SHRIMP_DOUBAO_API_URL;
+    if (strcmp(s_provider, "hunyuan") == 0) return SHRIMP_HUNYUAN_API_URL;
+    if (strcmp(s_provider, "baichuan") == 0) return SHRIMP_BAICHUAN_API_URL;
+    if (strcmp(s_provider, "qianfan") == 0) return SHRIMP_QIANFAN_API_URL;
+    if (strcmp(s_provider, "spark") == 0) return SHRIMP_SPARK_API_URL;
     return provider_is_openai_compatible() ? SHRIMP_OPENAI_API_URL : SHRIMP_LLM_API_URL;
 }
 

@@ -460,7 +460,7 @@ esp_err_t telegram_send_message(const char *chat_id, const char *text)
     /* Split long messages at 4096-char boundary */
     size_t text_len = strlen(text);
     size_t offset = 0;
-    int all_ok = 1;
+    bool all_ok = true;
 
     while (offset < text_len) {
         size_t chunk = text_len - offset;
@@ -489,7 +489,7 @@ esp_err_t telegram_send_message(const char *chat_id, const char *text)
         free(segment);
 
         if (!json_str) {
-            all_ok = 0;
+            all_ok = false;
             offset += chunk;
             continue;
         }
@@ -498,7 +498,7 @@ esp_err_t telegram_send_message(const char *chat_id, const char *text)
         char *resp = tg_api_call("sendMessage", json_str);
         free(json_str);
 
-        int sent_ok = 0;
+        bool sent_ok = false;
         bool markdown_failed = false;
         if (resp) {
             const char *desc = NULL;
@@ -543,7 +543,7 @@ esp_err_t telegram_send_message(const char *chat_id, const char *text)
         }
 
         if (!sent_ok) {
-            all_ok = 0;
+            all_ok = false;
         } else {
             if (markdown_failed) {
                 ESP_LOGI(TAG, "Plain-text fallback succeeded for %s", chat_id);
@@ -567,9 +567,23 @@ bool telegram_bot_is_configured(void)
 esp_err_t telegram_set_token(const char *token)
 {
     nvs_handle_t nvs;
-    ESP_ERROR_CHECK(nvs_open(SHRIMP_NVS_TG, NVS_READWRITE, &nvs));
-    ESP_ERROR_CHECK(nvs_set_str(nvs, SHRIMP_NVS_KEY_TG_TOKEN, token));
-    ESP_ERROR_CHECK(nvs_commit(nvs));
+    esp_err_t err = nvs_open(SHRIMP_NVS_TG, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS for telegram token: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    err = nvs_set_str(nvs, SHRIMP_NVS_KEY_TG_TOKEN, token);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set telegram token: %s", esp_err_to_name(err));
+        nvs_close(nvs);
+        return err;
+    }
+
+    err = nvs_commit(nvs);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to commit telegram NVS: %s", esp_err_to_name(err));
+    }
     nvs_close(nvs);
 
     strncpy(s_bot_token, token, sizeof(s_bot_token) - 1);

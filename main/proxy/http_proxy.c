@@ -68,11 +68,37 @@ esp_err_t http_proxy_init(void)
 esp_err_t http_proxy_set(const char *host, uint16_t port, const char *type)
 {
     nvs_handle_t nvs;
-    ESP_ERROR_CHECK(nvs_open(SHRIMP_NVS_PROXY, NVS_READWRITE, &nvs));
-    ESP_ERROR_CHECK(nvs_set_str(nvs, SHRIMP_NVS_KEY_PROXY_HOST, host));
-    ESP_ERROR_CHECK(nvs_set_u16(nvs, SHRIMP_NVS_KEY_PROXY_PORT, port));
-    ESP_ERROR_CHECK(nvs_set_str(nvs, "proxy_type", type));
-    ESP_ERROR_CHECK(nvs_commit(nvs));
+    esp_err_t err = nvs_open(SHRIMP_NVS_PROXY, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS for proxy config: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    err = nvs_set_str(nvs, SHRIMP_NVS_KEY_PROXY_HOST, host);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set proxy host: %s", esp_err_to_name(err));
+        nvs_close(nvs);
+        return err;
+    }
+
+    err = nvs_set_u16(nvs, SHRIMP_NVS_KEY_PROXY_PORT, port);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set proxy port: %s", esp_err_to_name(err));
+        nvs_close(nvs);
+        return err;
+    }
+
+    err = nvs_set_str(nvs, "proxy_type", type);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set proxy type: %s", esp_err_to_name(err));
+        nvs_close(nvs);
+        return err;
+    }
+
+    err = nvs_commit(nvs);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to commit proxy NVS: %s", esp_err_to_name(err));
+    }
     nvs_close(nvs);
 
     strncpy(s_proxy_host, host, sizeof(s_proxy_host) - 1);
@@ -129,54 +155,89 @@ static int sock_read_line(int fd, char *buf, int max, int timeout_ms)
     return pos;
 }
 
+#define PROXY_CONNECT_MAX_RETRIES     3
+#define PROXY_CONNECT_RETRY_DELAY_MS  1000
+
 /* Open TCP + CONNECT tunnel for HTTP proxy, returns socket fd or -1 */
 static int open_connect_tunnel(const char *host, int port, int timeout_ms)
 {
-    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
-    struct addrinfo *res = NULL;
-    char port_str[8];
-    snprintf(port_str, sizeof(port_str), "%d", s_proxy_port);
+    int last_error = 0;
 
-    if (getaddrinfo(s_proxy_host, port_str, &hints, &res) != 0 || !res) {
-        ESP_LOGE(TAG, "DNS resolve failed for proxy %s", s_proxy_host);
-        return -1;
+    for (int retry = 0; retry < PROXY_CONNECT_MAX_RETRIES; retry++) {
+        if (retry > 0) {
+            ESP_LOGW(TAG, "Retrying proxy connection (attempt %d/%d)", retry + 1, PROXY_CONNECT_MAX_RETRIES);
+            /* Exponential backoff */
+            int delay = PROXY_CONNECT_RETRY_DELAY_MS * (1 << (retry - 1));
+            usleep(delay * 1000);
+        }
+
+        struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
+        struct addrinfo *res = NULL;
+        char port_str[8];
+        snprintf(port_str, sizeof(port_str), "%d", s_proxy_port);
+
+        int dns_err = getaddrinfo(s_proxy_host, port_str, &hints, &res);
+        if (dns_err != 0 || !res) {
+            ESP_LOGE(TAG, "DNS resolve failed for proxy %s (error: %d)", s_proxy_host, dns_err);
+            last_error = -1;
+            continue;
+        }
+
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) {
+            freeaddrinfo(res);
+            last_error = -1;
+            continue;
+        }
+
+        struct timeval tv = { .tv_sec = timeout_ms / 1000, .tv_usec = (timeout_ms % 1000) * 1000 };
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) {
+            ESP_LOGE(TAG, "TCP connect to proxy %s:%d failed", s_proxy_host, s_proxy_port);
+            freeaddrinfo(res);
+            close(sock);
+            last_error = -1;
+            continue;
+        }
+        freeaddrinfo(res);
+        ESP_LOGI(TAG, "Connected to proxy %s:%d", s_proxy_host, s_proxy_port);
+
+        char req[256];
+        int len = snprintf(req, sizeof(req),
+            "CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n\r\n", host, port, host, port);
+
+        if (send(sock, req, len, 0) != len) {
+            ESP_LOGE(TAG, "Failed to send CONNECT");
+            close(sock);
+            last_error = -1;
+            continue;
+        }
+
+        char line[256];
+        if (sock_read_line(sock, line, sizeof(line), timeout_ms) < 0) {
+            ESP_LOGE(TAG, "No response from proxy");
+            close(sock);
+            last_error = -1;
+            continue;
+        }
+        if (strstr(line, "200") == NULL) {
+            ESP_LOGE(TAG, "CONNECT rejected: %s", line);
+            close(sock);
+            last_error = -1;
+            continue;
+        }
+
+        /* Consume remaining response headers */
+        while (sock_read_line(sock, line, sizeof(line), timeout_ms) > 0) { }
+
+        ESP_LOGI(TAG, "CONNECT tunnel established to %s:%d", host, port);
+        return sock;
     }
 
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) { freeaddrinfo(res); return -1; }
-
-    struct timeval tv = { .tv_sec = timeout_ms / 1000, .tv_usec = (timeout_ms % 1000) * 1000 };
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) {
-        ESP_LOGE(TAG, "TCP connect to proxy %s:%d failed", s_proxy_host, s_proxy_port);
-        freeaddrinfo(res); close(sock); return -1;
-    }
-    freeaddrinfo(res);
-    ESP_LOGI(TAG, "Connected to proxy %s:%d", s_proxy_host, s_proxy_port);
-
-    char req[256];
-    int len = snprintf(req, sizeof(req),
-        "CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n\r\n", host, port, host, port);
-
-    if (send(sock, req, len, 0) != len) {
-        ESP_LOGE(TAG, "Failed to send CONNECT"); close(sock); return -1;
-    }
-
-    char line[256];
-    if (sock_read_line(sock, line, sizeof(line), timeout_ms) < 0) {
-        ESP_LOGE(TAG, "No response from proxy"); close(sock); return -1;
-    }
-    if (strstr(line, "200") == NULL) {
-        ESP_LOGE(TAG, "CONNECT rejected: %s", line); close(sock); return -1;
-    }
-
-    /* Consume remaining response headers */
-    while (sock_read_line(sock, line, sizeof(line), timeout_ms) > 0) { }
-
-    ESP_LOGI(TAG, "CONNECT tunnel established to %s:%d", host, port);
-    return sock;
+    ESP_LOGE(TAG, "Proxy connection failed after %d retries", PROXY_CONNECT_MAX_RETRIES);
+    return last_error;
 }
 
 /* Open TCP + SOCKS5 tunnel, returns socket fd or -1 */

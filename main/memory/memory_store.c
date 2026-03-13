@@ -37,6 +37,16 @@ esp_err_t memory_read_long_term(char *buf, size_t size)
 
     size_t n = fread(buf, 1, size - 1, f);
     buf[n] = '\0';
+
+    /* Check if file was larger than buffer (truncated) */
+    if (n == size - 1) {
+        /* Try to read one more byte to detect truncation */
+        char test;
+        if (fread(&test, 1, 1, f) == 1) {
+            ESP_LOGW(TAG, "Long-term memory truncated to %d bytes (file larger than buffer)", (int)n);
+        }
+    }
+
     fclose(f);
     return ESP_OK;
 }
@@ -82,6 +92,7 @@ esp_err_t memory_read_recent(char *buf, size_t size, int days)
 {
     size_t offset = 0;
     buf[0] = '\0';
+    bool truncated = false;
 
     for (int i = 0; i < days && offset < size - 1; i++) {
         char date_str[16];
@@ -97,10 +108,24 @@ esp_err_t memory_read_recent(char *buf, size_t size, int days)
             offset += snprintf(buf + offset, size - offset, "\n---\n");
         }
 
-        size_t n = fread(buf + offset, 1, size - offset - 1, f);
+        size_t available = size - offset - 1;
+        size_t n = fread(buf + offset, 1, available, f);
+
+        if (n == available) {
+            /* Check if file has more data */
+            char test;
+            if (fread(&test, 1, 1, f) == 1) {
+                truncated = true;
+            }
+        }
+
         offset += n;
         buf[offset] = '\0';
         fclose(f);
+    }
+
+    if (truncated) {
+        ESP_LOGW(TAG, "Recent memory truncated, output exceeded %d bytes", (int)size);
     }
 
     return ESP_OK;

@@ -348,8 +348,12 @@ static esp_err_t feishu_get_tenant_token(void)
     }
 
     cJSON *root = cJSON_Parse(resp.buf);
+    if (!root) {
+        ESP_LOGE(TAG, "Failed to parse token response: %.200s", resp.buf);
+        free(resp.buf);
+        return ESP_FAIL;
+    }
     free(resp.buf);
-    if (!root) { ESP_LOGE(TAG, "Failed to parse token response"); return ESP_FAIL; }
 
     cJSON *code = cJSON_GetObjectItem(root, "code");
     if (!code || code->valueint != 0) {
@@ -577,29 +581,81 @@ static void feishu_ws_event_handler(void *arg, esp_event_base_t base, int32_t ev
     esp_websocket_event_data_t *e = (esp_websocket_event_data_t *)event_data;
     static uint8_t *rx_buf = NULL;
     static size_t rx_cap = 0;
+    static size_t rx_expected = 0;  /* Track expected total payload length */
+
     if (event_id == WEBSOCKET_EVENT_CONNECTED) {
         s_ws_connected = true;
-        ESP_LOGI(TAG, "Feishu WS connected");
-    } else if (event_id == WEBSOCKET_EVENT_DISCONNECTED) {
-        s_ws_connected = false;
-        ESP_LOGW(TAG, "Feishu WS disconnected");
-    } else if (event_id == WEBSOCKET_EVENT_DATA) {
-        if (e->op_code != WS_TRANSPORT_OPCODES_BINARY) return;
-        size_t need = e->payload_offset + e->data_len;
-        if (e->payload_offset == 0) {
-            if (rx_buf) free(rx_buf);
-            rx_cap = (e->payload_len > need) ? e->payload_len : need;
-            rx_buf = malloc(rx_cap);
-            if (!rx_buf) return;
-        } else if (!rx_buf || need > rx_cap) {
-            return;
-        }
-        memcpy(rx_buf + e->payload_offset, e->data_ptr, e->data_len);
-        if (need >= e->payload_len) {
-            feishu_handle_ws_frame(rx_buf, e->payload_len);
+        /* Clean up any stale buffer from previous connection */
+        if (rx_buf) {
             free(rx_buf);
             rx_buf = NULL;
             rx_cap = 0;
+            rx_expected = 0;
+        }
+        ESP_LOGI(TAG, "Feishu WS connected");
+    } else if (event_id == WEBSOCKET_EVENT_DISCONNECTED) {
+        s_ws_connected = false;
+        /* Clean up buffer on disconnect to prevent memory leak */
+        if (rx_buf) {
+            ESP_LOGW(TAG, "WS disconnected with pending partial frame, freeing buffer");
+            free(rx_buf);
+            rx_buf = NULL;
+            rx_cap = 0;
+            rx_expected = 0;
+        }
+        ESP_LOGW(TAG, "Feishu WS disconnected");
+    } else if (event_id == WEBSOCKET_EVENT_DATA) {
+        if (e->op_code != WS_TRANSPORT_OPCODES_BINARY) return;
+
+        size_t need = e->payload_offset + e->data_len;
+
+        if (e->payload_offset == 0) {
+            /* Start of a new frame */
+            if (rx_buf) {
+                /* Previous incomplete frame, free it */
+                ESP_LOGW(TAG, "New frame started with pending buffer, discarding old");
+                free(rx_buf);
+            }
+            rx_expected = e->payload_len;
+            rx_cap = (e->payload_len > need) ? e->payload_len : need;
+            /* Sanity check: cap buffer size to prevent OOM */
+            if (rx_cap > 64 * 1024) {
+                ESP_LOGE(TAG, "Frame too large: %d bytes, rejecting", (int)rx_cap);
+                rx_buf = NULL;
+                rx_cap = 0;
+                rx_expected = 0;
+                return;
+            }
+            rx_buf = malloc(rx_cap);
+            if (!rx_buf) {
+                ESP_LOGE(TAG, "Failed to allocate WS buffer %d bytes", (int)rx_cap);
+                rx_cap = 0;
+                rx_expected = 0;
+                return;
+            }
+        } else if (!rx_buf) {
+            /* Continuation without start - data loss */
+            ESP_LOGW(TAG, "Received frame continuation without start, dropping");
+            return;
+        } else if (need > rx_cap) {
+            /* Buffer overflow protection */
+            ESP_LOGE(TAG, "Frame overflow: need %d > cap %d", (int)need, (int)rx_cap);
+            free(rx_buf);
+            rx_buf = NULL;
+            rx_cap = 0;
+            rx_expected = 0;
+            return;
+        }
+
+        memcpy(rx_buf + e->payload_offset, e->data_ptr, e->data_len);
+
+        /* Check if frame is complete using expected length */
+        if (e->payload_offset + e->data_len >= rx_expected) {
+            feishu_handle_ws_frame(rx_buf, rx_expected);
+            free(rx_buf);
+            rx_buf = NULL;
+            rx_cap = 0;
+            rx_expected = 0;
         }
     }
 }
@@ -860,7 +916,7 @@ esp_err_t feishu_send_message(const char *chat_id, const char *text)
 
     size_t text_len = strlen(text);
     size_t offset = 0;
-    int all_ok = 1;
+    bool all_ok = true;
 
     while (offset < text_len) {
         size_t chunk = text_len - offset;
@@ -880,7 +936,7 @@ esp_err_t feishu_send_message(const char *chat_id, const char *text)
         cJSON_Delete(content);
         free(segment);
 
-        if (!content_str) { offset += chunk; all_ok = 0; continue; }
+        if (!content_str) { offset += chunk; all_ok = false; continue; }
 
         /* Build message body */
         cJSON *body = cJSON_CreateObject();
@@ -904,7 +960,7 @@ esp_err_t feishu_send_message(const char *chat_id, const char *text)
                         cJSON *msg = cJSON_GetObjectItem(root, "msg");
                         ESP_LOGW(TAG, "Send failed: code=%d, msg=%s",
                                  code->valueint, msg ? msg->valuestring : "unknown");
-                        all_ok = 0;
+                        all_ok = false;
                     } else {
                         ESP_LOGI(TAG, "Sent to %s (%d bytes)", chat_id, (int)chunk);
                     }
@@ -913,7 +969,7 @@ esp_err_t feishu_send_message(const char *chat_id, const char *text)
                 free(resp);
             } else {
                 ESP_LOGE(TAG, "Failed to send message chunk");
-                all_ok = 0;
+                all_ok = false;
             }
         }
 
@@ -979,10 +1035,30 @@ bool feishu_bot_is_configured(void)
 esp_err_t feishu_set_credentials(const char *app_id, const char *app_secret)
 {
     nvs_handle_t nvs;
-    ESP_ERROR_CHECK(nvs_open(SHRIMP_NVS_FEISHU, NVS_READWRITE, &nvs));
-    ESP_ERROR_CHECK(nvs_set_str(nvs, SHRIMP_NVS_KEY_FEISHU_APP_ID, app_id));
-    ESP_ERROR_CHECK(nvs_set_str(nvs, SHRIMP_NVS_KEY_FEISHU_APP_SECRET, app_secret));
-    ESP_ERROR_CHECK(nvs_commit(nvs));
+    esp_err_t err = nvs_open(SHRIMP_NVS_FEISHU, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS for feishu credentials: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    err = nvs_set_str(nvs, SHRIMP_NVS_KEY_FEISHU_APP_ID, app_id);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set feishu app_id: %s", esp_err_to_name(err));
+        nvs_close(nvs);
+        return err;
+    }
+
+    err = nvs_set_str(nvs, SHRIMP_NVS_KEY_FEISHU_APP_SECRET, app_secret);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set feishu app_secret: %s", esp_err_to_name(err));
+        nvs_close(nvs);
+        return err;
+    }
+
+    err = nvs_commit(nvs);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to commit feishu NVS: %s", esp_err_to_name(err));
+    }
     nvs_close(nvs);
 
     strncpy(s_app_id, app_id, sizeof(s_app_id) - 1);

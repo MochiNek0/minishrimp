@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -215,20 +216,41 @@ static esp_err_t cron_save_jobs(void)
         return ESP_ERR_NO_MEM;
     }
 
-    FILE *f = fopen(SHRIMP_CRON_FILE, "w");
+    size_t len = strlen(json_str);
+
+    /* Write to a temporary file first for atomicity */
+    char tmp_path[128];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", SHRIMP_CRON_FILE);
+
+    FILE *f = fopen(tmp_path, "w");
     if (!f) {
-        ESP_LOGE(TAG, "Failed to open %s for writing", SHRIMP_CRON_FILE);
+        ESP_LOGE(TAG, "Failed to open %s for writing", tmp_path);
         free(json_str);
         return ESP_FAIL;
     }
 
-    size_t len = strlen(json_str);
     size_t written = fwrite(json_str, 1, len, f);
+
+    /* Check write result before closing */
+    if (written != len) {
+        ESP_LOGE(TAG, "Cron save incomplete: %d/%d bytes", (int)written, (int)len);
+        fclose(f);
+        free(json_str);
+        /* Remove incomplete temporary file */
+        remove(tmp_path);
+        return ESP_FAIL;
+    }
+
+    /* Ensure data is flushed to storage */
+    fflush(f);
+    fsync(fileno(f));
     fclose(f);
     free(json_str);
 
-    if (written != len) {
-        ESP_LOGE(TAG, "Cron save incomplete: %d/%d bytes", (int)written, (int)len);
+    /* Rename temporary file to actual file (atomic on most filesystems) */
+    if (rename(tmp_path, SHRIMP_CRON_FILE) != 0) {
+        ESP_LOGE(TAG, "Failed to rename temp cron file to final");
+        remove(tmp_path);
         return ESP_FAIL;
     }
 
@@ -286,8 +308,11 @@ static void cron_process_due_jobs(void)
                 job->next_run = 0;
             }
         } else {
-            /* Recurring: compute next run */
-            job->next_run = now + job->interval_s;
+            /* Recurring: compute next run with overflow protection */
+            /* Limit interval to 1 year in seconds to prevent overflow */
+            const uint32_t max_interval = 365U * 24U * 3600U;
+            uint32_t safe_interval = (job->interval_s > max_interval) ? max_interval : job->interval_s;
+            job->next_run = now + (time_t)safe_interval;
         }
 
         changed = true;
@@ -315,7 +340,10 @@ static void compute_initial_next_run(cron_job_t *job)
     time_t now = time(NULL);
 
     if (job->kind == CRON_KIND_EVERY) {
-        job->next_run = now + job->interval_s;
+        /* Limit interval to 1 year in seconds to prevent overflow */
+        const uint32_t max_interval = 365U * 24U * 3600U;
+        uint32_t safe_interval = (job->interval_s > max_interval) ? max_interval : job->interval_s;
+        job->next_run = now + (time_t)safe_interval;
     } else if (job->kind == CRON_KIND_AT) {
         if (job->at_epoch > now) {
             job->next_run = job->at_epoch;

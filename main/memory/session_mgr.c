@@ -112,13 +112,17 @@ esp_err_t session_get_history_json(const char *chat_id, char *buf, size_t size, 
         int idx = (start + i) % max_msgs;
         cJSON *src = messages[idx];
 
-        cJSON *entry = cJSON_CreateObject();
         cJSON *role = cJSON_GetObjectItem(src, "role");
         cJSON *content = cJSON_GetObjectItem(src, "content");
-        if (role && content) {
-            cJSON_AddStringToObject(entry, "role", role->valuestring);
-            cJSON_AddStringToObject(entry, "content", content->valuestring);
+
+        /* Skip entries with missing role or content */
+        if (!role || !cJSON_IsString(role) || !content || !cJSON_IsString(content)) {
+            continue;
         }
+
+        cJSON *entry = cJSON_CreateObject();
+        cJSON_AddStringToObject(entry, "role", role->valuestring);
+        cJSON_AddStringToObject(entry, "content", content->valuestring);
         cJSON_AddItemToArray(arr, entry);
     }
 

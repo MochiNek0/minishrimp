@@ -8,6 +8,7 @@
 #include "esp_heap_caps.h"
 #include "esp_spiffs.h"
 #include "nvs_flash.h"
+#include "esp_sntp.h"
 
 #include "shrimp_config.h"
 #include "bus/message_bus.h"
@@ -26,6 +27,49 @@
 #include "skills/skill_loader.h"
 
 static const char *TAG = "shrimp";
+
+static void init_sntp(void)
+{
+    /* Set timezone from config */
+    setenv("TZ", SHRIMP_TIMEZONE, 1);
+    tzset();
+
+    /* Check if already initialized */
+    if (esp_sntp_get_sync_status() != SNTP_SYNC_STATUS_RESET) {
+        ESP_LOGI(TAG, "SNTP already initialized");
+        return;
+    }
+
+    /* Configure SNTP */
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_setservername(1, "time.nist.gov");
+
+    esp_sntp_init();
+    ESP_LOGI(TAG, "SNTP initialized, syncing time...");
+}
+
+static void wait_for_time_sync(int timeout_sec)
+{
+    int retry = 0;
+    while (retry < timeout_sec && sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET) {
+        ESP_LOGI(TAG, "Waiting for time sync... (%d/%d)", retry + 1, timeout_sec);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        retry++;
+    }
+
+    if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
+        time_t now;
+        time(&now);
+        struct tm tm_info;
+        localtime_r(&now, &tm_info);
+        char time_buf[64];
+        strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S %Z", &tm_info);
+        ESP_LOGI(TAG, "Time synchronized: %s", time_buf);
+    } else {
+        ESP_LOGW(TAG, "Time sync timeout, using unsynced time");
+    }
+}
 
 static esp_err_t init_nvs(void)
 {
@@ -151,6 +195,10 @@ void app_main(void)
         ESP_LOGI(TAG, "Waiting for WiFi connection...");
         if (wifi_manager_wait_connected(30000) == ESP_OK) {
             ESP_LOGI(TAG, "WiFi connected: %s", wifi_manager_get_ip());
+
+            /* Sync time via SNTP */
+            init_sntp();
+            wait_for_time_sync(10);
 
             /* Outbound dispatch task should start first to avoid dropping early replies. */
             ESP_ERROR_CHECK((xTaskCreatePinnedToCore(

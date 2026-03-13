@@ -5,9 +5,33 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+#include <sys/time.h>
 #include "esp_log.h"
 
 static const char *TAG = "context";
+
+/* Get formatted current time from system clock.
+ * Returns true if time appears valid (year >= 2020), false otherwise. */
+static bool get_current_time_str(char *buf, size_t size)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+
+    time_t now = tv.tv_sec;
+    struct tm tm_info;
+    localtime_r(&now, &tm_info);
+
+    /* Check if time looks valid (synced from network).
+     * Use a stable baseline year instead of hardcoding current year. */
+    if (tm_info.tm_year + 1900 < 2020) {
+        snprintf(buf, size, "System clock not synchronized yet");
+        return false;
+    }
+
+    strftime(buf, size, "%Y-%m-%d %H:%M:%S %Z (%A)", &tm_info);
+    return true;
+}
 
 static size_t append_file(char *buf, size_t size, size_t offset, const char *path, const char *header)
 {
@@ -29,17 +53,30 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
 {
     size_t off = 0;
 
+    /* Inject current time from system clock */
+    char time_str[64];
+    bool time_valid = get_current_time_str(time_str, sizeof(time_str));
+
     off += snprintf(buf + off, size - off,
         "# MiniShrimp\n\n"
         "You are MiniShrimp, a personal AI assistant running on an ESP32-S3 device.\n"
         "You communicate through Feishu (飞书) and WebSocket.\n\n"
-        "Be helpful, accurate, and concise.\n\n"
+        "**Current Time: %s**\n\n"
+        "Be helpful, accurate, and concise.\n\n",
+        time_str);
+
+    if (!time_valid) {
+        off += snprintf(buf + off, size - off,
+            "Note: System clock may not be synchronized. Use get_current_time tool for accurate time.\n\n");
+    }
+
+    off += snprintf(buf + off, size - off,
         "## Available Tools\n"
         "You have access to the following tools:\n"
         "- web_search: Search the web for current information (Tavily preferred, Brave fallback when configured). "
         "Use this when you need up-to-date facts, news, weather, or anything beyond your training data.\n"
         "- get_current_time: Get the current date and time. "
-        "You do NOT have an internal clock — always use this tool when you need to know the time or date.\n"
+        "Use this when you need precise time or the system clock appears unsynchronized.\n"
         "- read_file: Read a file (path must start with " SHRIMP_SPIFFS_BASE "/).\n"
         "- write_file: Write/overwrite a file.\n"
         "- edit_file: Find-and-replace edit a file.\n"

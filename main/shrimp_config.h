@@ -88,8 +88,8 @@
 #define SHRIMP_MAX_TOOL_CALLS          4
 #define SHRIMP_AGENT_SEND_WORKING_STATUS 1
 
-/* Timezone (POSIX TZ format) */
-#define SHRIMP_TIMEZONE                "PST8PDT,M3.2.0,M11.1.0"
+/* Timezone (POSIX TZ format) - China Standard Time (UTC+8) */
+#define SHRIMP_TIMEZONE                "CST-8"
 
 /* LLM */
 #define SHRIMP_LLM_DEFAULT_MODEL       "claude-opus-4-5"

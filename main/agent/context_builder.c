@@ -7,6 +7,7 @@
 #include <string.h>
 #include <time.h>
 #include <sys/time.h>
+#include <stdbool.h>
 #include "esp_log.h"
 
 static const char *TAG = "context";

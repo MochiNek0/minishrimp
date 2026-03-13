@@ -7,6 +7,7 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <unistd.h>
+#include <stdbool.h>
 
 #include "esp_log.h"
 #include "nvs.h"

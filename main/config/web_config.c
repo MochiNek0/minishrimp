@@ -10,6 +10,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include "esp_log.h"
 #include "esp_http_server.h"
 #include "esp_system.h"

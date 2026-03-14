@@ -76,6 +76,8 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
         "You have access to the following tools:\n"
         "- web_search: Search the web for current information (Tavily preferred, Brave fallback when configured). "
         "Use this when you need up-to-date facts, news, weather, or anything beyond your training data.\n"
+        "- web_fetch: Fetch and extract text content from a web page URL. "
+        "Use this when the user shares a link and wants you to read, summarize, or analyze the page content.\n"
         "- get_current_time: Get the current date and time. "
         "Use this when you need precise time or the system clock appears unsynchronized.\n"
         "- read_file: Read a file (path must start with " SHRIMP_SPIFFS_BASE "/).\n"

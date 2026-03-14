@@ -28,43 +28,64 @@
 
 static const char *TAG = "shrimp";
 
+static void time_sync_notification_cb(struct timeval *tv)
+{
+    ESP_LOGI(TAG, "SNTP time synchronization event triggered (底层同步成功)");
+}
+
 static void init_sntp(void)
 {
     /* Set timezone from config */
     setenv("TZ", SHRIMP_TIMEZONE, 1);
     tzset();
 
-    /* Check if already initialized */
-    if (esp_sntp_get_sync_status() != SNTP_SYNC_STATUS_RESET) {
-        ESP_LOGI(TAG, "SNTP already initialized");
-        return;
+    /* Stop SNTP if already running to allow reconfiguration */
+    if (esp_sntp_enabled()) {
+        esp_sntp_stop();
+        ESP_LOGI(TAG, "SNTP stopped for reconfiguration");
     }
 
-    /* Configure SNTP */
+    /* Configure SNTP with immediate sync mode */
+    esp_sntp_set_sync_mode(SNTP_SYNC_MODE_IMMED);
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    esp_sntp_setservername(0, "pool.ntp.org");
-    esp_sntp_setservername(1, "time.nist.gov");
+    
+    /* 注册时间同步回调 */
+    sntp_set_time_sync_notification_cb(time_sync_notification_cb);
+
+    esp_sntp_setservername(0, "203.107.6.88");      /* 阿里云 NTP IP */
+    esp_sntp_setservername(1, "139.199.214.202");   /* 腾讯云 NTP IP */
+    esp_sntp_setservername(2, "cn.pool.ntp.org");   /* 备用域名池 */
 
     esp_sntp_init();
-    ESP_LOGI(TAG, "SNTP initialized, syncing time...");
+    ESP_LOGI(TAG, "SNTP initialized, syncing time via %s...", esp_sntp_getservername(0));
 }
 
 static void wait_for_time_sync(int timeout_sec)
 {
     int retry = 0;
-    while (retry < timeout_sec && sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET) {
+    time_t now = 0;
+    struct tm timeinfo = { 0 };
+
+    // 循环检查系统时间，如果年份 > 2020，说明同步成功
+    while (retry < timeout_sec) {
+        time(&now);
+        localtime_r(&now, &timeinfo);
+        
+        // tm_year 是从 1900 年开始计算的。2020 年的 tm_year 是 120
+        if (timeinfo.tm_year >= (2020 - 1900)) {
+            break; 
+        }
+        
         ESP_LOGI(TAG, "Waiting for time sync... (%d/%d)", retry + 1, timeout_sec);
         vTaskDelay(pdMS_TO_TICKS(1000));
         retry++;
     }
 
-    if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
-        time_t now;
-        time(&now);
-        struct tm tm_info;
-        localtime_r(&now, &tm_info);
+    // 再次判断是否成功
+    if (timeinfo.tm_year >= (2020 - 1900)) {
         char time_buf[64];
-        strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S %Z", &tm_info);
+        // 打印带时区的当前时间
+        strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S %Z", &timeinfo);
         ESP_LOGI(TAG, "Time synchronized: %s", time_buf);
     } else {
         ESP_LOGW(TAG, "Time sync timeout, using unsynced time");
@@ -196,9 +217,13 @@ void app_main(void)
         if (wifi_manager_wait_connected(30000) == ESP_OK) {
             ESP_LOGI(TAG, "WiFi connected: %s", wifi_manager_get_ip());
 
+            /* Wait for network routes to stabilize */
+            ESP_LOGI(TAG, "Waiting 2 seconds for network routes to stabilize...");
+            vTaskDelay(pdMS_TO_TICKS(2000));
+
             /* Sync time via SNTP */
             init_sntp();
-            wait_for_time_sync(10);
+            wait_for_time_sync(30);
 
             /* Outbound dispatch task should start first to avoid dropping early replies. */
             ESP_ERROR_CHECK((xTaskCreatePinnedToCore(

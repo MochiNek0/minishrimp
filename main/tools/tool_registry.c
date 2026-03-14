@@ -1,6 +1,7 @@
 #include "tool_registry.h"
 #include "shrimp_config.h"
 #include "tools/tool_web_search.h"
+#include "tools/tool_web_fetch.h"
 #include "tools/tool_get_time.h"
 #include "tools/tool_files.h"
 #include "tools/tool_cron.h"
@@ -68,6 +69,18 @@ esp_err_t tool_registry_init(void)
         .execute = tool_web_search_execute,
     };
     register_tool(&ws);
+
+    /* Register web_fetch */
+    shrimp_tool_t wfe = {
+        .name = "web_fetch",
+        .description = "Fetch and extract text content from a web page URL. Use this when the user shares a link or wants to read a specific web page.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{\"url\":{\"type\":\"string\",\"description\":\"The full URL to fetch (e.g. https://example.com/article)\"}},"
+            "\"required\":[\"url\"]}",
+        .execute = tool_web_fetch_execute,
+    };
+    register_tool(&wfe);
 
     /* Register get_current_time */
     shrimp_tool_t gt = {

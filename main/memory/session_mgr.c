@@ -68,6 +68,36 @@ esp_err_t session_append(const char *chat_id, const char *role, const char *cont
     return ESP_OK;
 }
 
+/*
+ * Format timestamp as human-readable relative time.
+ * Returns "just now", "X min ago", "X hours ago", "yesterday", or date string.
+ */
+static void format_relative_time(time_t msg_ts, time_t now_ts, char *buf, size_t size)
+{
+    if (msg_ts <= 0 || now_ts <= 0) {
+        buf[0] = '\0';
+        return;
+    }
+
+    double diff = difftime(now_ts, msg_ts);
+
+    if (diff < 60) {
+        snprintf(buf, size, "just now");
+    } else if (diff < 3600) {
+        int mins = (int)(diff / 60);
+        snprintf(buf, size, "%d min ago", mins);
+    } else if (diff < 86400) {
+        int hours = (int)(diff / 3600);
+        snprintf(buf, size, "%d hours ago", hours);
+    } else if (diff < 172800) {
+        snprintf(buf, size, "yesterday");
+    } else {
+        struct tm tm_info;
+        localtime_r(&msg_ts, &tm_info);
+        strftime(buf, size, "%m/%d", &tm_info);
+    }
+}
+
 esp_err_t session_get_history_json(const char *chat_id, char *buf, size_t size, int max_msgs)
 {
     char path[128];
@@ -79,6 +109,9 @@ esp_err_t session_get_history_json(const char *chat_id, char *buf, size_t size, 
         snprintf(buf, size, "[]");
         return ESP_OK;
     }
+
+    /* Get current time for relative timestamps */
+    time_t now_ts = time(NULL);
 
     /* Read all lines into a ring buffer of cJSON objects */
     cJSON *messages[SHRIMP_SESSION_MAX_MSGS];
@@ -105,15 +138,36 @@ esp_err_t session_get_history_json(const char *chat_id, char *buf, size_t size, 
     }
     fclose(f);
 
-    /* Build JSON array with only role + content */
+    /* Check conversation freshness - if first msg is old, note it */
+    char freshness_note[256] = "";
+    if (count > 0) {
+        int start = (count < max_msgs) ? 0 : write_idx;
+        cJSON *first_obj = messages[start];
+        cJSON *first_ts = cJSON_GetObjectItem(first_obj, "ts");
+        if (first_ts && cJSON_IsNumber(first_ts)) {
+            time_t first_time = (time_t)first_ts->valuedouble;
+            double diff_hours = difftime(now_ts, first_time) / 3600.0;
+
+            if (diff_hours > 12) {
+                snprintf(freshness_note, sizeof(freshness_note),
+                    "\n[Note: This conversation started %.0f hours ago. "
+                    "If the user starts a new topic, treat it as a fresh conversation.]",
+                    diff_hours);
+            }
+        }
+    }
+
+    /* Build JSON array with role, content, and time hint */
     cJSON *arr = cJSON_CreateArray();
     int start = (count < max_msgs) ? 0 : write_idx;
+
     for (int i = 0; i < count; i++) {
         int idx = (start + i) % max_msgs;
         cJSON *src = messages[idx];
 
         cJSON *role = cJSON_GetObjectItem(src, "role");
         cJSON *content = cJSON_GetObjectItem(src, "content");
+        cJSON *ts = cJSON_GetObjectItem(src, "ts");
 
         /* Skip entries with missing role or content */
         if (!role || !cJSON_IsString(role) || !content || !cJSON_IsString(content)) {
@@ -122,7 +176,20 @@ esp_err_t session_get_history_json(const char *chat_id, char *buf, size_t size, 
 
         cJSON *entry = cJSON_CreateObject();
         cJSON_AddStringToObject(entry, "role", role->valuestring);
-        cJSON_AddStringToObject(entry, "content", content->valuestring);
+
+        /* Add time hint to content if available */
+        if (ts && cJSON_IsNumber(ts)) {
+            char time_hint[64];
+            format_relative_time((time_t)ts->valuedouble, now_ts, time_hint, sizeof(time_hint));
+
+            char content_with_time[2100];
+            snprintf(content_with_time, sizeof(content_with_time), "[%s] %s",
+                time_hint, content->valuestring);
+            cJSON_AddStringToObject(entry, "content", content_with_time);
+        } else {
+            cJSON_AddStringToObject(entry, "content", content->valuestring);
+        }
+
         cJSON_AddItemToArray(arr, entry);
     }
 
@@ -137,8 +204,14 @@ esp_err_t session_get_history_json(const char *chat_id, char *buf, size_t size, 
     cJSON_Delete(arr);
 
     if (json_str) {
-        strncpy(buf, json_str, size - 1);
-        buf[size - 1] = '\0';
+        if (freshness_note[0]) {
+            /* Prepend freshness note as a system hint */
+            snprintf(buf, size, "[{\"role\":\"system\",\"content\":\"%s\"},%s",
+                freshness_note + 1, json_str + 1);  /* Skip leading '[' */
+        } else {
+            strncpy(buf, json_str, size - 1);
+            buf[size - 1] = '\0';
+        }
         free(json_str);
     } else {
         snprintf(buf, size, "[]");

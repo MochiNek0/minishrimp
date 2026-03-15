@@ -315,32 +315,13 @@ static esp_err_t fetch_stream_via_proxy(const parsed_url_t *pu, const char *full
     int hlen;
 
     if (use_jina) {
-        /* URL-encode the original URL */
-        char encoded_url[512];
-        const char *src = full_url;
-        char *dst = encoded_url;
-        while (*src && dst < encoded_url + sizeof(encoded_url) - 4) {
-            unsigned char c = (unsigned char)*src;
-            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~' ||
-                c == '/' || c == ':' || c == '?' || c == '=' || c == '&') {
-                *dst++ = *src++;
-            } else {
-                static const char hex[] = "0123456789ABCDEF";
-                *dst++ = '%';
-                *dst++ = hex[c >> 4];
-                *dst++ = hex[c & 0x0F];
-                src++;
-            }
-        }
-        *dst = '\0';
-
+        /* Jina Reader expects the full original URL as path */
         hlen = snprintf(header, sizeof(header),
             "GET /%s HTTP/1.1\r\n"
             "Host: r.jina.ai\r\n"
             "Accept: text/plain\r\n"
             "Connection: close\r\n\r\n",
-            encoded_url);
+            full_url);
     } else {
         hlen = snprintf(header, sizeof(header),
             "GET %s HTTP/1.1\r\n"
@@ -409,18 +390,6 @@ static esp_err_t fetch_stream_via_proxy(const parsed_url_t *pu, const char *full
     return ESP_OK;
 }
 
-/* ── Check if response indicates blocking ─────────────────────── */
-
-static bool is_blocked_response(const char *text)
-{
-    if (!text || strlen(text) < 50) return false;
-
-    if (strcasestr(text, "cloudflare") && strcasestr(text, "challenge")) return true;
-    if (strcasestr(text, "Access Denied")) return true;
-    if (strcasestr(text, "captcha") && strcasestr(text, "recaptcha")) return true;
-
-    return false;
-}
 
 /* ── Execute ──────────────────────────────────────────────────── */
 
@@ -451,7 +420,6 @@ esp_err_t tool_web_fetch_execute(const char *input_json, char *output, size_t ou
         return ESP_ERR_INVALID_ARG;
     }
 
-    cJSON_Delete(input);
 
     /* Initialize stream processor - output buffer is provided by caller */
     stream_processor_t sp = {0};
@@ -459,42 +427,52 @@ esp_err_t tool_web_fetch_execute(const char *input_json, char *output, size_t ou
     sp.out_size = output_size;
     sp.last_was_space = true;
 
-    /* Try direct fetch first */
+    /* Try Jina Reader first (more reliable for content extraction) */
     esp_err_t err;
     bool use_proxy = http_proxy_is_enabled();
 
+    ESP_LOGI(TAG, "Trying Jina Reader first for reliable extraction...");
+
+    /* Reset processor for Jina */
+    memset(&sp, 0, sizeof(sp));
+    sp.output = output;
+    sp.out_size = output_size;
+    sp.is_jina = true;
+
     if (use_proxy) {
-        err = fetch_stream_via_proxy(&pu, url, false, &sp);
+        err = fetch_stream_via_proxy(&pu, url, true, &sp);
     } else {
-        err = fetch_stream_direct(url, &sp);
+        char jina_url[600];
+        snprintf(jina_url, sizeof(jina_url), "https://r.jina.ai/%s", url);
+        err = fetch_stream_direct(jina_url, &sp);
     }
 
-    /* Check if we need Jina Reader fallback */
-    bool need_jina = (err != ESP_OK) || (sp.status >= 400) || is_blocked_response(output);
+    /* Check if Jina fetch was successful and got meaningful content */
+    bool jina_success = (err == ESP_OK) && (sp.status < 400) && (sp.out_pos > 100);
 
-    if (need_jina) {
-        ESP_LOGI(TAG, "Direct fetch failed or blocked, trying Jina Reader...");
+    if (jina_success) {
+        ESP_LOGI(TAG, "Fetched %d chars via Jina Reader", (int)sp.out_pos);
+    } else {
+        /* Fallback to direct fetch if Jina failed */
+        ESP_LOGI(TAG, "Jina Reader failed, trying direct fetch...");
 
-        /* Reset processor for Jina */
         memset(&sp, 0, sizeof(sp));
         sp.output = output;
         sp.out_size = output_size;
-        sp.is_jina = true;
+        sp.last_was_space = true;
 
         if (use_proxy) {
-            err = fetch_stream_via_proxy(&pu, url, true, &sp);
+            err = fetch_stream_via_proxy(&pu, url, false, &sp);
         } else {
-            char jina_url[600];
-            snprintf(jina_url, sizeof(jina_url), "https://r.jina.ai/%s", url);
-            err = fetch_stream_direct(jina_url, &sp);
+            err = fetch_stream_direct(url, &sp);
         }
 
-        if (err == ESP_OK) {
-            ESP_LOGI(TAG, "Fetched %d chars via Jina Reader", (int)sp.out_pos);
+        if (err == ESP_OK && sp.status < 400 && sp.out_pos > 0) {
+            ESP_LOGI(TAG, "Fetched %d chars directly", (int)sp.out_pos);
         }
-    } else {
-        ESP_LOGI(TAG, "Fetched %d chars directly", (int)sp.out_pos);
     }
+
+    cJSON_Delete(input);
 
     if (err != ESP_OK) {
         snprintf(output, output_size, "Error: Failed to fetch URL. The page may require authentication or have anti-bot protection.");

@@ -223,7 +223,7 @@ static void agent_loop_task(void *arg)
                 shrimp_msg_t status = {0};
                 strncpy(status.channel, msg.channel, sizeof(status.channel) - 1);
                 strncpy(status.chat_id, msg.chat_id, sizeof(status.chat_id) - 1);
-                status.content = strdup("\xF0\x9F\xA6\x90 shrimp 正在处理...");
+                status.content = strdup("\xF0\x9F\xA6\x90 小虾米正在处理...");
                 if (status.content) {
                     if (message_bus_push_outbound(&status) != ESP_OK) {
                         ESP_LOGW(TAG, "Outbound queue full, drop working status");
@@ -248,6 +248,10 @@ static void agent_loop_task(void *arg)
                 /* Normal completion — save final text and break */
                 if (resp.text && resp.text_len > 0) {
                     final_text = strdup(resp.text);
+                    if (!final_text) {
+                        ESP_LOGE(TAG, "Failed to strdup final text (%d bytes)", (int)resp.text_len);
+                        snprintf(error_reason, sizeof(error_reason), "内存分配失败");
+                    }
                 } else {
                     snprintf(error_reason, sizeof(error_reason), "未返回有效内容");
                 }

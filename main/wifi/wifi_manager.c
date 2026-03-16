@@ -66,8 +66,17 @@ static void event_handler(void *arg, esp_event_base_t event_base,
             }
             ESP_LOGW(TAG, "Disconnected, retry %d/%d in %" PRIu32 "ms",
                      s_retry_count + 1, SHRIMP_WIFI_MAX_RETRY, delay_ms);
-            vTaskDelay(pdMS_TO_TICKS(delay_ms));
-            esp_wifi_connect();
+            
+            /* Do not block the event loop! Use a freeRTOS timer or simply non-blocking approach. */
+            /* We can use a quick one-shot task to do the delay and reconnect */
+            void reconnect_task(void *arg) {
+                uint32_t ms = (uint32_t)(uintptr_t)arg;
+                vTaskDelay(pdMS_TO_TICKS(ms));
+                esp_wifi_connect();
+                vTaskDelete(NULL);
+            }
+            xTaskCreate(reconnect_task, "wifi_recon", 2048, (void *)(uintptr_t)delay_ms, 5, NULL);
+            
             s_retry_count++;
         } else {
             ESP_LOGE(TAG, "Failed to connect after %d retries", SHRIMP_WIFI_MAX_RETRY);
@@ -491,11 +500,7 @@ esp_err_t wifi_manager_get_scan_results(char **out_json_str) {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
-    bool was_sta_connected = s_connected;
-    if (was_sta_connected) {
-        esp_wifi_disconnect();
-        vTaskDelay(pdMS_TO_TICKS(200));
-    }
+    /* We do not need to disconnect STA to scan. ESP32 supports scanning while connected. */
 
     /* Try scan with retries */
     esp_err_t err = ESP_FAIL;
@@ -513,9 +518,6 @@ esp_err_t wifi_manager_get_scan_results(char **out_json_str) {
         if (switched_to_apsta) {
             esp_wifi_set_mode(WIFI_MODE_AP);
         }
-        if (was_sta_connected) {
-            esp_wifi_connect();
-        }
         return err;
     }
 
@@ -527,9 +529,6 @@ esp_err_t wifi_manager_get_scan_results(char **out_json_str) {
         if (switched_to_apsta) {
             esp_wifi_set_mode(WIFI_MODE_AP);
         }
-        if (was_sta_connected) {
-            esp_wifi_connect();
-        }
         return ESP_ERR_NO_MEM;
     }
 
@@ -540,7 +539,7 @@ esp_err_t wifi_manager_get_scan_results(char **out_json_str) {
                 for (uint16_t i = 0; i < ap_count; i++) {
                     cJSON *ap_obj = cJSON_CreateObject();
                     char hex_buf[65] = {0};
-                    bytes_to_hex(ap_list[i].ssid, strlen((const char *)ap_list[i].ssid), hex_buf);
+                    bytes_to_hex(ap_list[i].ssid, strnlen((const char *)ap_list[i].ssid, 32), hex_buf);
 
                     cJSON_AddStringToObject(ap_obj, "ssid_hex", hex_buf);
                     cJSON_AddNumberToObject(ap_obj, "rssi", ap_list[i].rssi);
@@ -559,10 +558,6 @@ esp_err_t wifi_manager_get_scan_results(char **out_json_str) {
     if (switched_to_apsta) {
         esp_wifi_set_mode(WIFI_MODE_AP);
         ESP_LOGD(TAG, "Restored WiFi mode to AP");
-    }
-
-    if (was_sta_connected) {
-        esp_wifi_connect();
     }
 
     if (json_txt) {

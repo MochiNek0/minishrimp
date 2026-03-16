@@ -250,7 +250,11 @@ void app_main(void)
 
             ESP_LOGI(TAG, "All services started! Config UI: http://%s:%d/config", wifi_manager_get_ip(), SHRIMP_WS_PORT);
         } else {
-            ESP_LOGW(TAG, "WiFi connection timeout. Check credentials in the web config UI.");
+            ESP_LOGW(TAG, "WiFi connection timeout. Starting config access point...");
+            /* Fall back to AP mode so user can reconfigure WiFi */
+            ESP_ERROR_CHECK(wifi_manager_start_config_ap());
+            ESP_ERROR_CHECK(ws_server_start());
+            ESP_LOGI(TAG, "Connect to AP '%s' and open http://192.168.4.1:%d/config", SHRIMP_CONFIG_AP_SSID, SHRIMP_WS_PORT);
         }
     } else {
         ESP_LOGW(TAG, "No WiFi credentials. Starting config access point...");

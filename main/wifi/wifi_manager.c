@@ -308,15 +308,57 @@ esp_err_t wifi_manager_set_credentials(const char *ssid, const char *password)
     ESP_ERROR_CHECK(nvs_open(SHRIMP_NVS_WIFI, NVS_READWRITE, &nvs));
     ESP_ERROR_CHECK(nvs_set_str(nvs, SHRIMP_NVS_KEY_SSID, ssid));
     ESP_ERROR_CHECK(nvs_set_str(nvs, SHRIMP_NVS_KEY_PASS, password));
+
+    /* Also add to WiFi list as the first priority (keep existing entries as backup) */
+    size_t len = 0;
+    cJSON *list = NULL;
+    if (nvs_get_str(nvs, SHRIMP_NVS_KEY_WIFI_LIST, NULL, &len) == ESP_OK && len > 0) {
+        char *json_str = malloc(len);
+        if (json_str && nvs_get_str(nvs, SHRIMP_NVS_KEY_WIFI_LIST, json_str, &len) == ESP_OK) {
+            list = cJSON_Parse(json_str);
+        }
+        if (json_str) free(json_str);
+    }
+    if (!list || !cJSON_IsArray(list)) {
+        if (list) cJSON_Delete(list);
+        list = cJSON_CreateArray();
+    }
+
+    /* Remove existing entry with same SSID, then add to front */
+    int array_sz = cJSON_GetArraySize(list);
+    for (int i = array_sz - 1; i >= 0; i--) {
+        cJSON *item = cJSON_GetArrayItem(list, i);
+        cJSON *item_ssid = cJSON_GetObjectItem(item, "ssid");
+        if (item_ssid && cJSON_IsString(item_ssid) && strcmp(item_ssid->valuestring, ssid) == 0) {
+            cJSON_DeleteItemFromArray(list, i);
+        }
+    }
+    cJSON *new_item = cJSON_CreateObject();
+    cJSON_AddStringToObject(new_item, "ssid", ssid);
+    cJSON_AddStringToObject(new_item, "password", password);
+    cJSON_InsertItemInArray(list, 0, new_item);
+
+    /* Limit to 5 entries */
+    while (cJSON_GetArraySize(list) > 5) {
+        cJSON_DeleteItemFromArray(list, cJSON_GetArraySize(list) - 1);
+    }
+
+    char *json_str = cJSON_PrintUnformatted(list);
+    if (json_str) {
+        nvs_set_str(nvs, SHRIMP_NVS_KEY_WIFI_LIST, json_str);
+        free(json_str);
+    }
+    cJSON_Delete(list);
+
     ESP_ERROR_CHECK(nvs_commit(nvs));
     nvs_close(nvs);
-    ESP_LOGI(TAG, "WiFi single credential overridden for SSID: %s", ssid);
-    
+    ESP_LOGI(TAG, "WiFi credentials saved as priority: %s", ssid);
+
     strncpy(s_current_ssid, ssid, sizeof(s_current_ssid)-1);
     s_current_ssid[sizeof(s_current_ssid)-1] = '\0';
     strncpy(s_current_pass, password, sizeof(s_current_pass)-1);
     s_current_pass[sizeof(s_current_pass)-1] = '\0';
-    
+
     return ESP_OK;
 }
 
@@ -509,4 +551,121 @@ esp_err_t wifi_manager_get_scan_results(char **out_json_str) {
     }
     
     return ESP_ERR_NO_MEM;
+}
+
+esp_err_t wifi_manager_get_saved_list(char **out_json_str)
+{
+    if (!out_json_str) return ESP_ERR_INVALID_ARG;
+    *out_json_str = NULL;
+
+    nvs_handle_t nvs;
+    if (nvs_open(SHRIMP_NVS_WIFI, NVS_READONLY, &nvs) != ESP_OK) {
+        /* Return empty array if no NVS data */
+        *out_json_str = strdup("[]");
+        return *out_json_str ? ESP_OK : ESP_ERR_NO_MEM;
+    }
+
+    size_t len = 0;
+    char *json_str = NULL;
+    esp_err_t err = nvs_get_str(nvs, SHRIMP_NVS_KEY_WIFI_LIST, NULL, &len);
+
+    if (err == ESP_OK && len > 0) {
+        json_str = malloc(len);
+        if (json_str && nvs_get_str(nvs, SHRIMP_NVS_KEY_WIFI_LIST, json_str, &len) == ESP_OK) {
+            /* Validate it's a valid JSON array */
+            cJSON *list = cJSON_Parse(json_str);
+            if (list && cJSON_IsArray(list)) {
+                /* Build output with only SSID (no password) for security */
+                cJSON *out_arr = cJSON_CreateArray();
+                int sz = cJSON_GetArraySize(list);
+                for (int i = 0; i < sz; i++) {
+                    cJSON *item = cJSON_GetArrayItem(list, i);
+                    cJSON *ssid = cJSON_GetObjectItem(item, "ssid");
+                    if (ssid && cJSON_IsString(ssid)) {
+                        cJSON *out_item = cJSON_CreateObject();
+                        cJSON_AddStringToObject(out_item, "ssid", ssid->valuestring);
+                        cJSON_AddItemToArray(out_arr, out_item);
+                    }
+                }
+                cJSON_Delete(list);
+                char *out = cJSON_PrintUnformatted(out_arr);
+                cJSON_Delete(out_arr);
+                free(json_str);
+                nvs_close(nvs);
+                if (out) {
+                    *out_json_str = out;
+                    return ESP_OK;
+                }
+                return ESP_ERR_NO_MEM;
+            }
+            if (list) cJSON_Delete(list);
+        }
+        if (json_str) free(json_str);
+    }
+
+    nvs_close(nvs);
+    *out_json_str = strdup("[]");
+    return *out_json_str ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
+esp_err_t wifi_manager_delete_saved(const char *ssid)
+{
+    if (!ssid || ssid[0] == '\0') return ESP_ERR_INVALID_ARG;
+
+    nvs_handle_t nvs;
+    if (nvs_open(SHRIMP_NVS_WIFI, NVS_READWRITE, &nvs) != ESP_OK) {
+        return ESP_FAIL;
+    }
+
+    size_t len = 0;
+    char *json_str = NULL;
+    cJSON *list = NULL;
+
+    if (nvs_get_str(nvs, SHRIMP_NVS_KEY_WIFI_LIST, NULL, &len) == ESP_OK && len > 0) {
+        json_str = malloc(len);
+        if (json_str && nvs_get_str(nvs, SHRIMP_NVS_KEY_WIFI_LIST, json_str, &len) == ESP_OK) {
+            list = cJSON_Parse(json_str);
+        }
+        if (json_str) free(json_str);
+    }
+
+    if (!list || !cJSON_IsArray(list)) {
+        if (list) cJSON_Delete(list);
+        nvs_close(nvs);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    /* Find and delete the item */
+    bool found = false;
+    int sz = cJSON_GetArraySize(list);
+    for (int i = sz - 1; i >= 0; i--) {
+        cJSON *item = cJSON_GetArrayItem(list, i);
+        cJSON *item_ssid = cJSON_GetObjectItem(item, "ssid");
+        if (item_ssid && cJSON_IsString(item_ssid) &&
+            strcmp(item_ssid->valuestring, ssid) == 0) {
+            cJSON_DeleteItemFromArray(list, i);
+            found = true;
+            break;
+        }
+    }
+
+    if (!found) {
+        cJSON_Delete(list);
+        nvs_close(nvs);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    /* Save updated list */
+    char *new_json = cJSON_PrintUnformatted(list);
+    cJSON_Delete(list);
+
+    if (new_json) {
+        nvs_set_str(nvs, SHRIMP_NVS_KEY_WIFI_LIST, new_json);
+        nvs_commit(nvs);
+        free(new_json);
+    }
+
+    nvs_close(nvs);
+    ESP_LOGI(TAG, "Deleted WiFi from saved list: %s", ssid);
+    return ESP_OK;
 }

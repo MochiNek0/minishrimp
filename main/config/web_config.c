@@ -85,6 +85,16 @@ static const char *CONFIG_HTML =
 "@keyframes spin{to{transform:rotate(360deg)}}\n"
 ".spinner{display:none;width:18px;height:18px;border:2px solid var(--border);border-top-color:var(--primary);border-radius:50%;animation:spin .6s linear infinite}\n"
 ".spinner.active{display:inline-block}\n"
+".wifi-list{margin-top:12px;border:1px solid var(--border);border-radius:var(--radius-sm);overflow:hidden}\n"
+".wifi-item{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid var(--border);background:var(--bg-input)}\n"
+".wifi-item:last-child{border-bottom:none}\n"
+".wifi-item-name{font-size:14px;color:var(--text-main);display:flex;align-items:center;gap:8px}\n"
+".wifi-item-name svg{width:16px;height:16px;color:var(--primary)}\n"
+".wifi-item-actions{display:flex;gap:8px}\n"
+".btn-icon{padding:4px 8px;border-radius:4px;font-size:12px;cursor:pointer;transition:all .2s;background:transparent;border:1px solid var(--border);color:var(--text-muted)}\n"
+".btn-icon:hover{background:var(--border);color:var(--text-main)}\n"
+".btn-icon.danger:hover{background:rgba(239,68,68,.1);border-color:#ef4444;color:#ef4444}\n"
+".wifi-empty{padding:16px;text-align:center;color:var(--text-muted);font-size:13px}\n"
 "@media(max-width:600px){.grid{grid-template-columns:1fr}}\n"
 "</style>\n"
 "</head>\n"
@@ -97,7 +107,9 @@ static const char *CONFIG_HTML =
 "\n"
 "<div class=\"card\">\n"
 "<div class=\"card-title\"><svg fill=\"none\" viewBox=\"0 0 24 24\" stroke=\"currentColor\"><path stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-width=\"2\" d=\"M8.111 16.404a5.5 5.5 0 017.778 0M12 20h.01m-7.08-7.071c3.904-3.905 10.236-3.905 14.141 0M1.394 9.393c5.857-5.857 15.355-5.857 21.213 0\"/></svg>WiFi Settings</div>\n"
-"<div class=\"grid\"><div class=\"field\"><label>Available Networks</label><select id=\"wifi_select\"><option value=\"\">-- Scan to discover --</option></select></div></div>\n"
+"<label style=\"font-size:13px;font-weight:500;color:var(--text-muted)\">Saved Networks</label>\n"
+"<div id=\"wifi_saved_list\" class=\"wifi-list\"><div class=\"wifi-empty\">Loading...</div></div>\n"
+"<div class=\"grid\" style=\"margin-top:20px\"><div class=\"field\"><label>Scan New Networks</label><select id=\"wifi_select\"><option value=\"\">-- Scan to discover --</option></select></div></div>\n"
 "<div class=\"grid\" style=\"margin-top:20px\">\n"
 "<div class=\"field\"><label>SSID (Manual / Hidden)</label><input id=\"wifi_ssid\" placeholder=\"Enter SSID\"></div>\n"
 "<div class=\"field\"><label>Password</label><div class=\"pwd-wrap\"><input id=\"wifi_pass\" type=\"password\" placeholder=\"WiFi password\"><button type=\"button\" class=\"pwd-toggle\" onclick=\"togglePwd(this)\"><svg viewBox=\"0 0 24 24\"><path d=\"M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z\"></path></svg></button></div></div>\n"
@@ -164,6 +176,22 @@ static const char *CONFIG_HTML =
 " el.className='badge '+(ok?'ok':'warn');\n"
 " el.textContent=ok?'\\u2713 Configured':'Empty';\n"
 "}\n"
+"async function loadSavedWiFi(){\n"
+" try{\n"
+"  const r=await fetch('/api/wifi/saved');const list=await r.json();\n"
+"  const el=document.getElementById('wifi_saved_list');\n"
+"  if(!list.length){el.innerHTML='<div class=\"wifi-empty\">No saved networks</div>';return;}\n"
+"  el.innerHTML=list.map(w=>'<div class=\"wifi-item\"><span class=\"wifi-item-name\"><svg fill=\"none\" viewBox=\"0 0 24 24\" stroke=\"currentColor\"><path stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-width=\"2\" d=\"M8.111 16.404a5.5 5.5 0 017.778 0M12 20h.01m-7.08-7.071c3.904-3.905 10.236-3.905 14.141 0M1.394 9.393c5.857-5.857 15.355-5.857 21.213 0\"/></svg>'+w.ssid+'</span><span class=\"wifi-item-actions\"><button class=\"btn-icon\" onclick=\"selectWiFi(\\''+w.ssid+'\\')\">Use</button><button class=\"btn-icon danger\" onclick=\"deleteWiFi(\\''+w.ssid+'\\')\">Delete</button></span></div>').join('');\n"
+" }catch(e){document.getElementById('wifi_saved_list').innerHTML='<div class=\"wifi-empty\">Failed to load</div>';}\n"
+"}\n"
+"function selectWiFi(ssid){document.getElementById('wifi_ssid').value=ssid;document.getElementById('wifi_pass').focus();}\n"
+"async function deleteWiFi(ssid){\n"
+" if(!confirm('Delete '+ssid+'?'))return;\n"
+" try{\n"
+"  const r=await fetch('/api/wifi/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid:ssid})});\n"
+"  if(r.ok){loadSavedWiFi();}\n"
+" }catch(e){}\n"
+"}\n"
 "async function loadConfig(){\n"
 " try{\n"
 "  const r=await fetch('/api/config');const c=await r.json();\n"
@@ -188,6 +216,7 @@ static const char *CONFIG_HTML =
 "  setBadge(document.getElementById('api_key_status'),c.api_key_set);\n"
 "  setBadge(document.getElementById('search_status'),c.search_key_set);\n"
 "  setBadge(document.getElementById('tavily_status'),c.tavily_key_set);\n"
+"  loadSavedWiFi();\n"
 " }catch(e){\n"
 "  statusEl.className='status warn';statusEl.textContent='Load failed';\n"
 " }\n"
@@ -296,6 +325,63 @@ static esp_err_t handle_wifi_scan(httpd_req_t *req)
     }
     httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Scan failed");
     return ESP_FAIL;
+}
+
+static esp_err_t handle_wifi_saved(httpd_req_t *req)
+{
+    char *json_str = NULL;
+    esp_err_t err = wifi_manager_get_saved_list(&json_str);
+    if (err == ESP_OK && json_str) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+        free(json_str);
+        return ESP_OK;
+    }
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to get saved list");
+    return ESP_FAIL;
+}
+
+static esp_err_t handle_wifi_delete(httpd_req_t *req)
+{
+    if (req->content_len > 256) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "payload too large");
+        return ESP_FAIL;
+    }
+
+    char *buf = calloc(1, req->content_len + 1);
+    if (!buf) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no mem");
+        return ESP_FAIL;
+    }
+
+    int received = httpd_req_recv(req, buf, req->content_len);
+    if (received <= 0) {
+        free(buf);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid body");
+        return ESP_FAIL;
+    }
+
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid json");
+        return ESP_FAIL;
+    }
+
+    cJSON *ssid = cJSON_GetObjectItem(root, "ssid");
+    esp_err_t err = ESP_FAIL;
+    if (ssid && cJSON_IsString(ssid) && ssid->valuestring[0]) {
+        err = wifi_manager_delete_saved(ssid->valuestring);
+    }
+    cJSON_Delete(root);
+
+    httpd_resp_set_type(req, "application/json");
+    if (err == ESP_OK) {
+        httpd_resp_sendstr(req, "{\"ok\":true}");
+    } else {
+        httpd_resp_sendstr(req, "{\"ok\":false}");
+    }
+    return ESP_OK;
 }
 
 static esp_err_t handle_config_page(httpd_req_t *req)
@@ -639,10 +725,26 @@ esp_err_t web_config_register(httpd_handle_t server)
         .user_ctx = NULL
     };
 
+    httpd_uri_t wifi_saved = {
+        .uri = "/api/wifi/saved",
+        .method = HTTP_GET,
+        .handler = handle_wifi_saved,
+        .user_ctx = NULL
+    };
+
+    httpd_uri_t wifi_delete = {
+        .uri = "/api/wifi/delete",
+        .method = HTTP_POST,
+        .handler = handle_wifi_delete,
+        .user_ctx = NULL
+    };
+
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &page));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &get_cfg));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &post_cfg));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wifi_scan));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wifi_saved));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wifi_delete));
 
     ESP_LOGI(TAG, "Config UI available at /config");
     return ESP_OK;

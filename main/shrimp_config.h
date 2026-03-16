@@ -23,7 +23,7 @@
 #define SHRIMP_SECRET_MODEL           ""
 #endif
 #ifndef SHRIMP_SECRET_MODEL_PROVIDER
-#define SHRIMP_SECRET_MODEL_PROVIDER  "anthropic"
+#define SHRIMP_SECRET_MODEL_PROVIDER  "custom"
 #endif
 #ifndef SHRIMP_SECRET_PROXY_HOST
 #define SHRIMP_SECRET_PROXY_HOST      ""
@@ -130,6 +130,7 @@
 #define SHRIMP_USER_FILE               SHRIMP_SPIFFS_CONFIG_DIR "/USER.md"
 #define SHRIMP_CONTEXT_BUF_SIZE        (16 * 1024)
 #define SHRIMP_SESSION_MAX_MSGS        20
+#define SHRIMP_SESSION_MAX_FILE_SIZE   (50 * 1024)  /* 50KB max per session file */
 
 /* Cron / Heartbeat */
 #define SHRIMP_CRON_FILE               SHRIMP_SPIFFS_BASE "/cron.json"

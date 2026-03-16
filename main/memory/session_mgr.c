@@ -40,10 +40,114 @@ esp_err_t session_mgr_init(void)
     return ESP_OK;
 }
 
+/*
+ * Trim session file to keep only the most recent messages.
+ * Reads the file, keeps the last SHRIMP_SESSION_MAX_MSGS messages,
+ * and rewrites the file.
+ */
+static void trim_session_file(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+
+    /* Count total lines first */
+    int total_lines = 0;
+    char line[2048];
+    while (fgets(line, sizeof(line), f)) {
+        total_lines++;
+    }
+
+    /* If small enough, no need to trim */
+    if (total_lines <= SHRIMP_SESSION_MAX_MSGS) {
+        fclose(f);
+        return;
+    }
+
+    /* Seek back to beginning */
+    fseek(f, 0, SEEK_SET);
+
+    /* Read all lines into memory (using ring buffer approach) */
+    char **lines = calloc(SHRIMP_SESSION_MAX_MSGS, sizeof(char *));
+    if (!lines) {
+        fclose(f);
+        ESP_LOGW(TAG, "Cannot allocate memory for trimming");
+        return;
+    }
+
+    int write_idx = 0;
+    int count = 0;
+
+    while (fgets(line, sizeof(line), f)) {
+        /* Strip newline for storage */
+        size_t len = strlen(line);
+        if (len > 0 && line[len - 1] == '\n') {
+            line[len - 1] = '\0';
+            len--;
+        }
+
+        /* Free old line if overwriting */
+        if (count >= SHRIMP_SESSION_MAX_MSGS) {
+            free(lines[write_idx]);
+        }
+
+        /* Store the line */
+        lines[write_idx] = strdup(line);
+        write_idx = (write_idx + 1) % SHRIMP_SESSION_MAX_MSGS;
+        if (count < SHRIMP_SESSION_MAX_MSGS) count++;
+    }
+    fclose(f);
+
+    /* Rewrite the file with only the recent messages */
+    f = fopen(path, "w");
+    if (!f) {
+        ESP_LOGE(TAG, "Cannot rewrite session file %s", path);
+        for (int i = 0; i < count; i++) {
+            free(lines[i]);
+        }
+        free(lines);
+        return;
+    }
+
+    int start = (count < SHRIMP_SESSION_MAX_MSGS) ? 0 : write_idx;
+    for (int i = 0; i < count; i++) {
+        int idx = (start + i) % SHRIMP_SESSION_MAX_MSGS;
+        if (lines[idx]) {
+            fprintf(f, "%s\n", lines[idx]);
+            free(lines[idx]);
+        }
+    }
+    free(lines);
+    fclose(f);
+
+    ESP_LOGI(TAG, "Trimmed session file from %d to %d lines", total_lines, count);
+}
+
+/*
+ * Check file size and trim if necessary.
+ */
+static void check_and_trim_session(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+
+    /* Get file size */
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fclose(f);
+
+    if (size > SHRIMP_SESSION_MAX_FILE_SIZE) {
+        ESP_LOGW(TAG, "Session file too large (%ld bytes), trimming", size);
+        trim_session_file(path);
+    }
+}
+
 esp_err_t session_append(const char *chat_id, const char *role, const char *content)
 {
     char path[128];
     session_path(chat_id, path, sizeof(path));
+
+    /* Check and trim before appending if file is too large */
+    check_and_trim_session(path);
 
     FILE *f = fopen(path, "a");
     if (!f) {

@@ -68,3 +68,17 @@ esp_err_t wifi_manager_get_scan_results(char **out_json_str);
  * @param json_str Array of objects [{"ssid": "...", "password": "..."}, ...]
  */
 esp_err_t wifi_manager_set_wifi_list(const char *json_str);
+
+/**
+ * Get saved WiFi list as JSON string (caller must free()).
+ * @param out_json_str Output pointer to receive JSON string
+ * @return ESP_OK on success, error otherwise
+ */
+esp_err_t wifi_manager_get_saved_list(char **out_json_str);
+
+/**
+ * Delete a WiFi from the saved list by SSID.
+ * @param ssid SSID to delete
+ * @return ESP_OK on success, ESP_ERR_NOT_FOUND if not found
+ */
+esp_err_t wifi_manager_delete_saved(const char *ssid);

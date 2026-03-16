@@ -1075,3 +1075,13 @@ esp_err_t llm_set_custom_prefix(const char *prefix)
     ESP_LOGI(TAG, "Custom prefix set");
     return ESP_OK;
 }
+
+const char *llm_get_model(void)
+{
+    return s_model;
+}
+
+const char *llm_get_provider(void)
+{
+    return s_provider;
+}

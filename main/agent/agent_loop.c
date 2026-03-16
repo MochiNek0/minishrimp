@@ -223,7 +223,7 @@ static void agent_loop_task(void *arg)
                 shrimp_msg_t status = {0};
                 strncpy(status.channel, msg.channel, sizeof(status.channel) - 1);
                 strncpy(status.chat_id, msg.chat_id, sizeof(status.chat_id) - 1);
-                status.content = strdup("\xF0\x9F\xA6\x90 小虾米正在处理...");
+                status.content = strdup("小虾米正在处理...");
                 if (status.content) {
                     if (message_bus_push_outbound(&status) != ESP_OK) {
                         ESP_LOGW(TAG, "Outbound queue full, drop working status");
@@ -319,7 +319,7 @@ static void agent_loop_task(void *arg)
             strncpy(out.chat_id, msg.chat_id, sizeof(out.chat_id) - 1);
             
             char err_msg[256];
-            snprintf(err_msg, sizeof(err_msg), "\xF0\x9F\xA6\x90 抱歉，处理出错了：%s", 
+            snprintf(err_msg, sizeof(err_msg), "抱歉，处理出错了：%s", 
                      error_reason[0] ? error_reason : "未知错误");
             out.content = strdup(err_msg);
             

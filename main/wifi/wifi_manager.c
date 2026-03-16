@@ -465,7 +465,7 @@ void wifi_manager_scan_and_print(void)
 esp_err_t wifi_manager_get_scan_results(char **out_json_str) {
     if (!out_json_str) return ESP_ERR_INVALID_ARG;
     *out_json_str = NULL;
-    
+
     wifi_scan_config_t scan_cfg = {
         .ssid = NULL,
         .bssid = NULL,
@@ -477,32 +477,45 @@ esp_err_t wifi_manager_get_scan_results(char **out_json_str) {
 
     wifi_mode_t old_mode;
     esp_wifi_get_mode(&old_mode);
+
+    bool switched_to_apsta = false;
     if (old_mode == WIFI_MODE_AP) {
-        esp_wifi_set_mode(WIFI_MODE_APSTA);
+        /* Switch to APSTA to enable STA scanning while keeping AP alive */
+        esp_err_t mode_err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+        if (mode_err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to switch to APSTA mode: %s", esp_err_to_name(mode_err));
+            return mode_err;
+        }
+        switched_to_apsta = true;
         /* Wait for STA interface to be ready after mode switch */
-        vTaskDelay(pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
-    bool reconnect = s_connected;
-    if (s_connected) {
+    bool was_sta_connected = s_connected;
+    if (was_sta_connected) {
         esp_wifi_disconnect();
         vTaskDelay(pdMS_TO_TICKS(200));
     }
 
-    esp_err_t err = esp_wifi_scan_start(&scan_cfg, true);
-    if (err != ESP_OK) {
-        /* Retry after a delay instead of stop/start which kills the AP */
-        ESP_LOGW(TAG, "Scan attempt 1 failed (%s), retrying...", esp_err_to_name(err));
-        vTaskDelay(pdMS_TO_TICKS(500));
+    /* Try scan with retries */
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 0; attempt < 3; attempt++) {
         err = esp_wifi_scan_start(&scan_cfg, true);
+        if (err == ESP_OK) {
+            break;
+        }
+        ESP_LOGW(TAG, "Scan attempt %d failed (%s), retrying...", attempt + 1, esp_err_to_name(err));
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
-    
+
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Scan failed: %s", esp_err_to_name(err));
-        if (old_mode == WIFI_MODE_AP) {
+        ESP_LOGE(TAG, "Scan failed after retries: %s", esp_err_to_name(err));
+        if (switched_to_apsta) {
             esp_wifi_set_mode(WIFI_MODE_AP);
         }
-        if (reconnect) esp_wifi_connect();
+        if (was_sta_connected) {
+            esp_wifi_connect();
+        }
         return err;
     }
 
@@ -511,7 +524,12 @@ esp_err_t wifi_manager_get_scan_results(char **out_json_str) {
     
     cJSON *root = cJSON_CreateArray();
     if (!root) {
-        if (reconnect) esp_wifi_connect();
+        if (switched_to_apsta) {
+            esp_wifi_set_mode(WIFI_MODE_AP);
+        }
+        if (was_sta_connected) {
+            esp_wifi_connect();
+        }
         return ESP_ERR_NO_MEM;
     }
 
@@ -523,7 +541,7 @@ esp_err_t wifi_manager_get_scan_results(char **out_json_str) {
                     cJSON *ap_obj = cJSON_CreateObject();
                     char hex_buf[65] = {0};
                     bytes_to_hex(ap_list[i].ssid, strlen((const char *)ap_list[i].ssid), hex_buf);
-                    
+
                     cJSON_AddStringToObject(ap_obj, "ssid_hex", hex_buf);
                     cJSON_AddNumberToObject(ap_obj, "rssi", ap_list[i].rssi);
                     cJSON_AddNumberToObject(ap_obj, "auth", ap_list[i].authmode);
@@ -533,23 +551,25 @@ esp_err_t wifi_manager_get_scan_results(char **out_json_str) {
             free(ap_list);
         }
     }
-    
+
     char *json_txt = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
-    
-    if (old_mode == WIFI_MODE_AP) {
+
+    /* Restore original WiFi mode */
+    if (switched_to_apsta) {
         esp_wifi_set_mode(WIFI_MODE_AP);
+        ESP_LOGD(TAG, "Restored WiFi mode to AP");
     }
-    
-    if (reconnect) {
+
+    if (was_sta_connected) {
         esp_wifi_connect();
     }
-    
+
     if (json_txt) {
         *out_json_str = json_txt;
         return ESP_OK;
     }
-    
+
     return ESP_ERR_NO_MEM;
 }
 

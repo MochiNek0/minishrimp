@@ -74,3 +74,15 @@ esp_err_t llm_chat_tools(const char *system_prompt,
                          cJSON *messages,
                          const char *tools_json,
                          llm_response_t *resp);
+
+/**
+ * Get the current model name.
+ * @return Pointer to internal string (do not free), or empty string if not set.
+ */
+const char *llm_get_model(void);
+
+/**
+ * Get the current provider name.
+ * @return Pointer to internal string (do not free), or empty string if not set.
+ */
+const char *llm_get_provider(void);

@@ -2,6 +2,7 @@
 #include "shrimp_config.h"
 #include "memory/memory_store.h"
 #include "skills/skill_loader.h"
+#include "llm/llm_proxy.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -59,10 +60,12 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
     bool time_valid = get_current_time_str(time_str, sizeof(time_str));
 
     off += snprintf(buf + off, size - off,
-        "# MiniShrimp\n\n"
+        "# MiniShrimp (小虾米)\n\n"
         "You are MiniShrimp, a personal AI assistant running on an ESP32-S3 device.\n"
+        "When asked who you are, say your name is '小虾米' (Little Shrimp) in Chinese.\n"
         "You communicate through Feishu (飞书) and WebSocket.\n\n"
         "**Current Time: %s**\n\n"
+        "**Backend Model: %s (%s)**\n\n"
         "## Time Awareness\n\n"
         "IMPORTANT: Pay attention to time context in conversations:\n"
         "- Always check the current time above before responding\n"
@@ -71,7 +74,7 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
         "- When greeting the user, consider the time of day (morning/afternoon/evening)\n"
         "- If you're unsure about time context, use get_current_time tool\n\n"
         "Be helpful, accurate, and concise.\n\n",
-        time_str);
+        time_str, llm_get_model(), llm_get_provider());
 
     if (!time_valid) {
         off += snprintf(buf + off, size - off,

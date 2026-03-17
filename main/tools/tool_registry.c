@@ -5,6 +5,7 @@
 #include "tools/tool_get_time.h"
 #include "tools/tool_files.h"
 #include "tools/tool_cron.h"
+#include "tools/tool_weather.h"
 
 #include <string.h>
 #include "esp_log.h"
@@ -12,7 +13,7 @@
 
 static const char *TAG = "tools";
 
-#define MAX_TOOLS 12
+#define MAX_TOOLS 24
 
 static shrimp_tool_t s_tools[MAX_TOOLS];
 static int s_tool_count = 0;
@@ -188,6 +189,24 @@ esp_err_t tool_registry_init(void)
         .execute = tool_cron_remove_execute,
     };
     register_tool(&cr);
+
+    /* Register get_weather */
+    tool_weather_init();
+    shrimp_tool_t gw = {
+        .name = "get_weather",
+        .description = "Get current weather or forecast for a city. Use this when the user asks about the weather in a specific location. "
+        "Optional: provide start_date and end_date (YYYY-MM-DD format) for multi-day forecast.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{"
+            "\"city\":{\"type\":\"string\",\"description\":\"City name (e.g. Beijing, Shanghai, Tokyo)\"},"
+            "\"start_date\":{\"type\":\"string\",\"description\":\"Start date for forecast (YYYY-MM-DD, optional)\"},"
+            "\"end_date\":{\"type\":\"string\",\"description\":\"End date for forecast (YYYY-MM-DD, optional)\"}"
+            "},"
+            "\"required\":[\"city\"]}",
+        .execute = tool_weather_execute,
+    };
+    register_tool(&gw);
 
     build_tools_json();
 

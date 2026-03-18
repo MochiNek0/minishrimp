@@ -186,22 +186,44 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 
 /* ── Provider helpers ──────────────────────────────────────────── */
 
+/* Provider lookup table for O(1) comparison */
+static const struct {
+    const char *name;
+    const char *url;
+    bool is_openai_compatible;
+} s_provider_table[] = {
+    {"openai",    SHRIMP_OPENAI_API_URL,    true},
+    {"qwen",      SHRIMP_QWEN_API_URL,      true},
+    {"gemini",    SHRIMP_GEMINI_API_URL,    true},
+    {"deepseek",  SHRIMP_DEEPSEEK_API_URL,  true},
+    {"zhipu",     SHRIMP_ZHIPU_API_URL,     true},
+    {"moonshot",  SHRIMP_MOONSHOT_API_URL,  true},
+    {"minimax",   SHRIMP_MINIMAX_API_URL,   true},
+    {"yi",        SHRIMP_YI_API_URL,        true},
+    {"doubao",    SHRIMP_DOUBAO_API_URL,    true},
+    {"hunyuan",   SHRIMP_HUNYUAN_API_URL,   true},
+    {"baichuan",  SHRIMP_BAICHUAN_API_URL,  true},
+    {"qianfan",   SHRIMP_QIANFAN_API_URL,   true},
+    {"spark",     SHRIMP_SPARK_API_URL,     true},
+    {"custom",    NULL,                     true},
+    /* Anthropic (not OpenAI-compatible) */
+    {"anthropic", SHRIMP_LLM_API_URL,       false},
+};
+
+static int find_provider_index(void)
+{
+    for (size_t i = 0; i < sizeof(s_provider_table) / sizeof(s_provider_table[0]); i++) {
+        if (strcmp(s_provider, s_provider_table[i].name) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
 static bool provider_is_openai_compatible(void)
 {
-    return strcmp(s_provider, "openai") == 0 ||
-           strcmp(s_provider, "qwen") == 0 ||
-           strcmp(s_provider, "gemini") == 0 ||
-           strcmp(s_provider, "deepseek") == 0 ||
-           strcmp(s_provider, "zhipu") == 0 ||
-           strcmp(s_provider, "moonshot") == 0 ||
-           strcmp(s_provider, "minimax") == 0 ||
-           strcmp(s_provider, "yi") == 0 ||
-           strcmp(s_provider, "doubao") == 0 ||
-           strcmp(s_provider, "hunyuan") == 0 ||
-           strcmp(s_provider, "baichuan") == 0 ||
-           strcmp(s_provider, "qianfan") == 0 ||
-           strcmp(s_provider, "spark") == 0 ||
-           strcmp(s_provider, "custom") == 0;
+    int idx = find_provider_index();
+    return idx >= 0 && s_provider_table[idx].is_openai_compatible;
 }
 
 static bool provider_requires_custom_url(void)
@@ -209,34 +231,16 @@ static bool provider_requires_custom_url(void)
     return strcmp(s_provider, "custom") == 0;
 }
 
-static bool provider_is_qwen(void)
-{
-    return strcmp(s_provider, "qwen") == 0;
-}
-
-static bool provider_is_gemini(void)
-{
-    return strcmp(s_provider, "gemini") == 0;
-}
-
 static const char *provider_base_url(void)
 {
     if (provider_requires_custom_url()) {
         return s_custom_url[0] ? s_custom_url : NULL;
     }
-    if (provider_is_qwen()) return SHRIMP_QWEN_API_URL;
-    if (provider_is_gemini()) return SHRIMP_GEMINI_API_URL;
-    if (strcmp(s_provider, "deepseek") == 0) return SHRIMP_DEEPSEEK_API_URL;
-    if (strcmp(s_provider, "zhipu") == 0) return SHRIMP_ZHIPU_API_URL;
-    if (strcmp(s_provider, "moonshot") == 0) return SHRIMP_MOONSHOT_API_URL;
-    if (strcmp(s_provider, "minimax") == 0) return SHRIMP_MINIMAX_API_URL;
-    if (strcmp(s_provider, "yi") == 0) return SHRIMP_YI_API_URL;
-    if (strcmp(s_provider, "doubao") == 0) return SHRIMP_DOUBAO_API_URL;
-    if (strcmp(s_provider, "hunyuan") == 0) return SHRIMP_HUNYUAN_API_URL;
-    if (strcmp(s_provider, "baichuan") == 0) return SHRIMP_BAICHUAN_API_URL;
-    if (strcmp(s_provider, "qianfan") == 0) return SHRIMP_QIANFAN_API_URL;
-    if (strcmp(s_provider, "spark") == 0) return SHRIMP_SPARK_API_URL;
-    return provider_is_openai_compatible() ? SHRIMP_OPENAI_API_URL : SHRIMP_LLM_API_URL;
+    int idx = find_provider_index();
+    if (idx >= 0 && s_provider_table[idx].url) {
+        return s_provider_table[idx].url;
+    }
+    return SHRIMP_LLM_API_URL;
 }
 
 static const char *llm_api_url(void)
@@ -914,166 +918,68 @@ esp_err_t llm_chat_tools(const char *system_prompt,
 
 /* ── NVS helpers ──────────────────────────────────────────────── */
 
-esp_err_t llm_set_api_key(const char *api_key)
+/* Helper: save a string key to NVS and update local cache */
+static esp_err_t llm_nvs_set_str(const char *key, const char *value, char *cache, size_t cache_size)
 {
     nvs_handle_t nvs;
     esp_err_t err = nvs_open(SHRIMP_NVS_LLM, NVS_READWRITE, &nvs);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open NVS for api_key: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Failed to open NVS for %s: %s", key, esp_err_to_name(err));
         return err;
     }
 
-    err = nvs_set_str(nvs, SHRIMP_NVS_KEY_API_KEY, api_key);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set api_key in NVS: %s", esp_err_to_name(err));
-        nvs_close(nvs);
-        return err;
-    }
-
-    err = nvs_commit(nvs);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to commit NVS for api_key: %s", esp_err_to_name(err));
+    err = nvs_set_str(nvs, key, value);
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs);
     }
     nvs_close(nvs);
 
-    safe_copy(s_api_key, sizeof(s_api_key), api_key);
-    ESP_LOGI(TAG, "API key saved");
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save %s: %s", key, esp_err_to_name(err));
+        return err;
+    }
+
+    safe_copy(cache, cache_size, value);
+    ESP_LOGI(TAG, "%s saved", key);
     return ESP_OK;
+}
+
+esp_err_t llm_set_api_key(const char *api_key)
+{
+    return llm_nvs_set_str(SHRIMP_NVS_KEY_API_KEY, api_key, s_api_key, sizeof(s_api_key));
 }
 
 esp_err_t llm_set_model(const char *model)
 {
-    nvs_handle_t nvs;
-    esp_err_t err = nvs_open(SHRIMP_NVS_LLM, NVS_READWRITE, &nvs);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open NVS for model: %s", esp_err_to_name(err));
-        return err;
+    esp_err_t err = llm_nvs_set_str(SHRIMP_NVS_KEY_MODEL, model, s_model, sizeof(s_model));
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Model set to: %s", s_model);
     }
-
-    err = nvs_set_str(nvs, SHRIMP_NVS_KEY_MODEL, model);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set model in NVS: %s", esp_err_to_name(err));
-        nvs_close(nvs);
-        return err;
-    }
-
-    err = nvs_commit(nvs);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to commit NVS for model: %s", esp_err_to_name(err));
-    }
-    nvs_close(nvs);
-
-    safe_copy(s_model, sizeof(s_model), model);
-    ESP_LOGI(TAG, "Model set to: %s", s_model);
-    return ESP_OK;
+    return err;
 }
 
 esp_err_t llm_set_provider(const char *provider)
 {
-    nvs_handle_t nvs;
-    esp_err_t err = nvs_open(SHRIMP_NVS_LLM, NVS_READWRITE, &nvs);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open NVS for provider: %s", esp_err_to_name(err));
-        return err;
+    esp_err_t err = llm_nvs_set_str(SHRIMP_NVS_KEY_PROVIDER, provider, s_provider, sizeof(s_provider));
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Provider set to: %s", s_provider);
     }
-
-    err = nvs_set_str(nvs, SHRIMP_NVS_KEY_PROVIDER, provider);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set provider in NVS: %s", esp_err_to_name(err));
-        nvs_close(nvs);
-        return err;
-    }
-
-    err = nvs_commit(nvs);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to commit NVS for provider: %s", esp_err_to_name(err));
-    }
-    nvs_close(nvs);
-
-    safe_copy(s_provider, sizeof(s_provider), provider);
-    ESP_LOGI(TAG, "Provider set to: %s", s_provider);
-    return ESP_OK;
+    return err;
 }
 
 esp_err_t llm_set_custom_url(const char *url)
 {
-    nvs_handle_t nvs;
-    esp_err_t err = nvs_open(SHRIMP_NVS_LLM, NVS_READWRITE, &nvs);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open NVS for custom_url: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    err = nvs_set_str(nvs, SHRIMP_NVS_KEY_CUSTOM_URL, url);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set custom_url in NVS: %s", esp_err_to_name(err));
-        nvs_close(nvs);
-        return err;
-    }
-
-    err = nvs_commit(nvs);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to commit NVS for custom_url: %s", esp_err_to_name(err));
-    }
-    nvs_close(nvs);
-
-    safe_copy(s_custom_url, sizeof(s_custom_url), url);
-    ESP_LOGI(TAG, "Custom URL set");
-    return ESP_OK;
+    return llm_nvs_set_str(SHRIMP_NVS_KEY_CUSTOM_URL, url, s_custom_url, sizeof(s_custom_url));
 }
 
 esp_err_t llm_set_custom_header(const char *header_name)
 {
-    nvs_handle_t nvs;
-    esp_err_t err = nvs_open(SHRIMP_NVS_LLM, NVS_READWRITE, &nvs);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open NVS for custom_header: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    err = nvs_set_str(nvs, SHRIMP_NVS_KEY_CUSTOM_HEADER, header_name);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set custom_header in NVS: %s", esp_err_to_name(err));
-        nvs_close(nvs);
-        return err;
-    }
-
-    err = nvs_commit(nvs);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to commit NVS for custom_header: %s", esp_err_to_name(err));
-    }
-    nvs_close(nvs);
-
-    safe_copy(s_custom_header, sizeof(s_custom_header), header_name);
-    ESP_LOGI(TAG, "Custom header set");
-    return ESP_OK;
+    return llm_nvs_set_str(SHRIMP_NVS_KEY_CUSTOM_HEADER, header_name, s_custom_header, sizeof(s_custom_header));
 }
 
 esp_err_t llm_set_custom_prefix(const char *prefix)
 {
-    nvs_handle_t nvs;
-    esp_err_t err = nvs_open(SHRIMP_NVS_LLM, NVS_READWRITE, &nvs);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open NVS for custom_prefix: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    err = nvs_set_str(nvs, SHRIMP_NVS_KEY_CUSTOM_PREFIX, prefix);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set custom_prefix in NVS: %s", esp_err_to_name(err));
-        nvs_close(nvs);
-        return err;
-    }
-
-    err = nvs_commit(nvs);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to commit NVS for custom_prefix: %s", esp_err_to_name(err));
-    }
-    nvs_close(nvs);
-
-    safe_copy(s_custom_prefix, sizeof(s_custom_prefix), prefix);
-    ESP_LOGI(TAG, "Custom prefix set");
-    return ESP_OK;
+    return llm_nvs_set_str(SHRIMP_NVS_KEY_CUSTOM_PREFIX, prefix, s_custom_prefix, sizeof(s_custom_prefix));
 }
 
 const char *llm_get_model(void)

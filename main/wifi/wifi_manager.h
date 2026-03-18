@@ -82,3 +82,12 @@ esp_err_t wifi_manager_get_saved_list(char **out_json_str);
  * @return ESP_OK on success, ESP_ERR_NOT_FOUND if not found
  */
 esp_err_t wifi_manager_delete_saved(const char *ssid);
+
+/**
+ * Connect to a specific WiFi network immediately.
+ * Saves credentials as primary and initiates connection.
+ * @param ssid SSID to connect to
+ * @param password Password (can be empty for open networks)
+ * @return ESP_OK on connection initiated
+ */
+esp_err_t wifi_manager_connect_to(const char *ssid, const char *password);

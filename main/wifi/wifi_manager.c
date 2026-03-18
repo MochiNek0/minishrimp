@@ -10,6 +10,7 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "cJSON.h"
+#include "freertos/semphr.h"
 
 static const char *TAG = "wifi";
 
@@ -19,6 +20,8 @@ static char s_ip_str[16] = "0.0.0.0";
 static bool s_connected = false;
 static char s_current_ssid[33] = {0};
 static char s_current_pass[65] = {0};
+static bool s_is_config_ap_mode = false;
+static SemaphoreHandle_t s_scan_done_sem = NULL;
 
 #define WIFI_CANDIDATE_MAX  10
 
@@ -137,12 +140,24 @@ static void event_handler(void *arg, esp_event_base_t event_base,
                           int32_t event_id, void *event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
+        /* Only auto-connect if not in config AP mode */
+        if (!s_is_config_ap_mode) {
+            esp_wifi_connect();
+        }
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_SCAN_DONE) {
+        /* Signal scan completion */
+        if (s_scan_done_sem) {
+            xSemaphoreGive(s_scan_done_sem);
+        }
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         s_connected = false;
         wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)event_data;
         if (disc) {
             ESP_LOGW(TAG, "Disconnected (reason=%d:%s)", disc->reason, wifi_reason_to_str(disc->reason));
+        }
+        /* Don't auto-reconnect in config AP mode */
+        if (s_is_config_ap_mode) {
+            return;
         }
         if (s_retry_count < SHRIMP_WIFI_MAX_RETRY) {
             /* Exponential backoff: 1s, 2s, 4s, 8s, ... capped at 30s */
@@ -186,7 +201,6 @@ static void event_handler(void *arg, esp_event_base_t event_base,
             } else {
                 ESP_LOGE(TAG, "All candidates failed.");
                 xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-                /* Consider triggering fallback to AP here if needed */
             }
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
@@ -236,27 +250,7 @@ esp_err_t wifi_manager_start(void)
 {
     wifi_config_t wifi_cfg = {0};
 
-    /* Scan surrounding APs to match with NVS list */
-    ESP_LOGI(TAG, "Starting boot-time WiFi scan...");
-    wifi_scan_config_t scan_cfg = {0};
-    esp_err_t err = esp_wifi_scan_start(&scan_cfg, true);
-    
-    uint16_t ap_count = 0;
-    wifi_ap_record_t *ap_list = NULL;
-    
-    if (err == ESP_OK) {
-        esp_wifi_scan_get_ap_num(&ap_count);
-        if (ap_count > 0) {
-            ap_list = calloc(ap_count, sizeof(wifi_ap_record_t));
-            if (ap_list) {
-                esp_wifi_scan_get_ap_records(&ap_count, ap_list);
-            }
-        }
-    } else {
-        ESP_LOGE(TAG, "Boot-time WiFi scan failed: %s", esp_err_to_name(err));
-    }
-
-    /* 1. Collect all nearby networks from the NVS WiFi list */
+    /* 1. Collect ALL candidates from NVS WiFi list (no scan filtering yet) */
     nvs_handle_t nvs;
     s_candidate_count = 0;
     s_current_candidate_idx = 0;
@@ -276,23 +270,9 @@ esp_err_t wifi_manager_start(void)
                         cJSON *pass = cJSON_GetObjectItem(item, "password");
                         
                         if (ssid && cJSON_IsString(ssid) && pass && cJSON_IsString(pass)) {
-                            bool is_nearby = false;
-                            if (!ap_list || ap_count == 0) {
-                                is_nearby = true;
-                            } else {
-                                for (uint16_t j = 0; j < ap_count; j++) {
-                                    if (strcmp((const char *)ap_list[j].ssid, ssid->valuestring) == 0) {
-                                        is_nearby = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            
-                            if (is_nearby) {
-                                strncpy(s_candidates[s_candidate_count].ssid, ssid->valuestring, 32);
-                                strncpy(s_candidates[s_candidate_count].pass, pass->valuestring, 64);
-                                s_candidate_count++;
-                            }
+                            strncpy(s_candidates[s_candidate_count].ssid, ssid->valuestring, 32);
+                            strncpy(s_candidates[s_candidate_count].pass, pass->valuestring, 64);
+                            s_candidate_count++;
                         }
                     }
                 }
@@ -318,7 +298,7 @@ esp_err_t wifi_manager_start(void)
         nvs_close(nvs);
     }
 
-    /* 2. Collect build-time secrets if not already in list or as fallback */
+    /* 2. Add build-time secrets if not already in list */
     if (SHRIMP_SECRET_WIFI_SSID[0] != '\0' && s_candidate_count < WIFI_CANDIDATE_MAX) {
         bool already_added = false;
         for (int i = 0; i < s_candidate_count; i++) {
@@ -335,26 +315,111 @@ esp_err_t wifi_manager_start(void)
     }
 
     if (s_candidate_count == 0) {
-        if (ap_list) free(ap_list);
         ESP_LOGW(TAG, "No WiFi credentials available. Use AP to configure.");
         return ESP_ERR_NOT_FOUND;
     }
 
+    ESP_LOGI(TAG, "Collected %d WiFi candidates", s_candidate_count);
+    for (int i = 0; i < s_candidate_count; i++) {
+        ESP_LOGI(TAG, "  Candidate %d: %s", i + 1, s_candidates[i].ssid);
+    }
+
+    /* 3. Start WiFi first (we need STA running before we can scan)
+     *    Use a temporary dummy config; the real one will be set after scan.
+     *    Set defer flag so STA_START event doesn't auto-connect. */
+    s_is_config_ap_mode = true;  /* Temporarily prevent auto-connect on STA_START */
+    strncpy((char *)wifi_cfg.sta.ssid, s_candidates[0].ssid, sizeof(wifi_cfg.sta.ssid) - 1);
+    strncpy((char *)wifi_cfg.sta.password, s_candidates[0].pass, sizeof(wifi_cfg.sta.password) - 1);
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    /* 4. Now scan for nearby APs */
+    ESP_LOGI(TAG, "Starting boot-time WiFi scan...");
+    
+    if (!s_scan_done_sem) {
+        s_scan_done_sem = xSemaphoreCreateBinary();
+    }
+    xSemaphoreTake(s_scan_done_sem, 0); /* clear stale signal */
+
+    wifi_scan_config_t scan_cfg = {0};
+    uint16_t ap_count = 0;
+    wifi_ap_record_t *ap_list = NULL;
+
+    esp_err_t err = esp_wifi_scan_start(&scan_cfg, false);
+    if (err == ESP_OK) {
+        if (xSemaphoreTake(s_scan_done_sem, pdMS_TO_TICKS(5000)) == pdTRUE) {
+            esp_wifi_scan_get_ap_num(&ap_count);
+            if (ap_count > 0) {
+                ap_list = calloc(ap_count, sizeof(wifi_ap_record_t));
+                if (ap_list) {
+                    esp_wifi_scan_get_ap_records(&ap_count, ap_list);
+                    ESP_LOGI(TAG, "Boot scan found %u APs:", ap_count);
+                    for (uint16_t i = 0; i < ap_count; i++) {
+                        ESP_LOGI(TAG, "  [%u] %s (RSSI=%d)", i + 1,
+                                 (const char *)ap_list[i].ssid, ap_list[i].rssi);
+                    }
+                }
+            }
+        } else {
+            ESP_LOGW(TAG, "Boot scan timed out");
+            esp_wifi_scan_stop();
+        }
+    } else {
+        ESP_LOGW(TAG, "Boot scan failed: %s (proceeding with all candidates)", esp_err_to_name(err));
+    }
+
+    /* 5. Reorder candidates: nearby APs first, then the rest as fallback */
+    if (ap_list && ap_count > 0) {
+        wifi_candidate_t reordered[WIFI_CANDIDATE_MAX];
+        int nearby_count = 0;
+
+        /* First pass: add candidates that match a scanned AP (by signal strength order) */
+        for (int i = 0; i < s_candidate_count; i++) {
+            for (uint16_t j = 0; j < ap_count; j++) {
+                if (strcmp(s_candidates[i].ssid, (const char *)ap_list[j].ssid) == 0) {
+                    reordered[nearby_count++] = s_candidates[i];
+                    ESP_LOGI(TAG, "  -> Nearby match: %s (RSSI=%d)", s_candidates[i].ssid, ap_list[j].rssi);
+                    break;
+                }
+            }
+        }
+
+        /* Second pass: add remaining candidates not seen nearby */
+        for (int i = 0; i < s_candidate_count; i++) {
+            bool found_nearby = false;
+            for (int k = 0; k < nearby_count; k++) {
+                if (strcmp(s_candidates[i].ssid, reordered[k].ssid) == 0) {
+                    found_nearby = true;
+                    break;
+                }
+            }
+            if (!found_nearby && nearby_count < WIFI_CANDIDATE_MAX) {
+                reordered[nearby_count++] = s_candidates[i];
+            }
+        }
+
+        memcpy(s_candidates, reordered, sizeof(reordered));
+        s_candidate_count = nearby_count;
+    }
+
     if (ap_list) free(ap_list);
 
-    /* 3. Start connecting to the first candidate */
-    strncpy(s_current_ssid, s_candidates[0].ssid, sizeof(s_current_ssid)-1);
-    strncpy(s_current_pass, s_candidates[0].pass, sizeof(s_current_pass)-1);
+    /* 6. Connect to the first (best) candidate */
+    s_is_config_ap_mode = false;  /* Re-enable auto-reconnect on disconnect */
+
+    strncpy(s_current_ssid, s_candidates[0].ssid, sizeof(s_current_ssid) - 1);
+    strncpy(s_current_pass, s_candidates[0].pass, sizeof(s_current_pass) - 1);
     s_current_candidate_idx = 0;
 
-    strncpy((char *)wifi_cfg.sta.ssid, s_current_ssid, sizeof(wifi_cfg.sta.ssid)-1);
-    strncpy((char *)wifi_cfg.sta.password, s_current_pass, sizeof(wifi_cfg.sta.password)-1);
+    memset(&wifi_cfg, 0, sizeof(wifi_cfg));
+    strncpy((char *)wifi_cfg.sta.ssid, s_current_ssid, sizeof(wifi_cfg.sta.ssid) - 1);
+    strncpy((char *)wifi_cfg.sta.password, s_current_pass, sizeof(wifi_cfg.sta.password) - 1);
 
     ESP_LOGI(TAG, "Starting connection sequence with %d candidates. Primary: %s", 
              s_candidate_count, s_current_ssid);
 
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
-    ESP_ERROR_CHECK(esp_wifi_start());
+    esp_wifi_connect();
 
     return ESP_OK;
 }
@@ -427,6 +492,8 @@ esp_err_t wifi_manager_set_wifi_list(const char *json_str) {
 
 esp_err_t wifi_manager_start_config_ap(void)
 {
+    s_is_config_ap_mode = true;
+
     wifi_config_t ap_cfg = {0};
     const char *ssid = SHRIMP_CONFIG_AP_SSID;
     const char *pass = SHRIMP_CONFIG_AP_PASS;
@@ -438,13 +505,15 @@ esp_err_t wifi_manager_start_config_ap(void)
     ap_cfg.ap.max_connection = 4;
     ap_cfg.ap.authmode = (pass[0] == '\0') ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA_WPA2_PSK;
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    /* Use APSTA mode so STA interface is available for WiFi scanning */
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "Config AP started: SSID=%s (IP: 192.168.4.1)", ssid);
+    ESP_LOGI(TAG, "Config AP started in APSTA mode: SSID=%s (IP: 192.168.4.1)", ssid);
     return ESP_OK;
 }
+
 EventGroupHandle_t wifi_manager_get_event_group(void)
 {
     return s_wifi_event_group;
@@ -452,65 +521,12 @@ EventGroupHandle_t wifi_manager_get_event_group(void)
 
 void wifi_manager_scan_and_print(void)
 {
-    wifi_scan_config_t scan_cfg = {
-        .ssid = NULL,
-        .bssid = NULL,
-        .channel = 0,
-        .show_hidden = true,
-    };
-
-    ESP_LOGI(TAG, "Scanning nearby APs...");
-
-    /* Pause auto-connect to allow scan */
-    esp_wifi_disconnect();
-    vTaskDelay(pdMS_TO_TICKS(200));
-
-    esp_err_t err = esp_wifi_scan_start(&scan_cfg, true /* block */);
-    if (err == ESP_ERR_WIFI_STATE) {
-        /* Try a quick stop/start cycle and scan again */
-        esp_wifi_stop();
-        vTaskDelay(pdMS_TO_TICKS(200));
-        esp_wifi_start();
-        vTaskDelay(pdMS_TO_TICKS(200));
-        err = esp_wifi_scan_start(&scan_cfg, true /* block */);
-    }
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Scan failed: %s", esp_err_to_name(err));
-        esp_wifi_connect();
-        return;
-    }
-
-    uint16_t ap_count = 0;
-    esp_wifi_scan_get_ap_num(&ap_count);
-    if (ap_count == 0) {
-        ESP_LOGW(TAG, "No APs found");
-        esp_wifi_connect();
-        return;
-    }
-
-    wifi_ap_record_t *ap_list = calloc(ap_count, sizeof(wifi_ap_record_t));
-    if (!ap_list) {
-        ESP_LOGE(TAG, "Out of memory for AP list");
-        return;
-    }
-
-    uint16_t ap_max = ap_count;
-    if (esp_wifi_scan_get_ap_records(&ap_max, ap_list) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to get AP records");
-        free(ap_list);
-        esp_wifi_connect();
-        return;
-    }
-
-    ESP_LOGI(TAG, "Found %u APs:", ap_max);
-    for (uint16_t i = 0; i < ap_max; i++) {
-        const wifi_ap_record_t *ap = &ap_list[i];
-        ESP_LOGI(TAG, "  [%u] SSID=%s RSSI=%d CH=%d Auth=%d",
-                 i + 1, (const char *)ap->ssid, ap->rssi, ap->primary, ap->authmode);
-    }
-
-    free(ap_list);
-    esp_wifi_connect();
+    /* This function is now a no-op during boot.
+     * Boot-time scanning is already done inside wifi_manager_start().
+     * Calling disconnect/reconnect here would break the candidate
+     * connection flow, so we just log and return.
+     */
+    ESP_LOGI(TAG, "scan_and_print: boot scan already completed in wifi_manager_start()");
 }
 
 esp_err_t wifi_manager_get_scan_results(char **out_json_str) {
@@ -526,40 +542,37 @@ esp_err_t wifi_manager_get_scan_results(char **out_json_str) {
 
     ESP_LOGI(TAG, "Scanning nearby APs for API...");
 
-    wifi_mode_t old_mode;
-    esp_wifi_get_mode(&old_mode);
-
-    bool switched_to_apsta = false;
-    if (old_mode == WIFI_MODE_AP) {
-        /* Switch to APSTA to enable STA scanning while keeping AP alive */
-        esp_err_t mode_err = esp_wifi_set_mode(WIFI_MODE_APSTA);
-        if (mode_err != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to switch to APSTA mode: %s", esp_err_to_name(mode_err));
-            return mode_err;
-        }
-        switched_to_apsta = true;
-        /* Wait for STA interface to be ready after mode switch */
-        vTaskDelay(pdMS_TO_TICKS(1000));
+    /* Create semaphore for non-blocking scan if not yet created */
+    if (!s_scan_done_sem) {
+        s_scan_done_sem = xSemaphoreCreateBinary();
     }
 
-    /* We do not need to disconnect STA to scan. ESP32 supports scanning while connected. */
-
-    /* Try scan with retries */
+    /* Config AP already runs in APSTA mode, so no mode switching needed.
+     * STA mode also supports scanning while connected.
+     * Use non-blocking scan to avoid starving other tasks. */
     esp_err_t err = ESP_FAIL;
     for (int attempt = 0; attempt < 3; attempt++) {
-        err = esp_wifi_scan_start(&scan_cfg, true);
+        /* Clear any stale semaphore signal */
+        xSemaphoreTake(s_scan_done_sem, 0);
+
+        err = esp_wifi_scan_start(&scan_cfg, false /* non-blocking */);
         if (err == ESP_OK) {
-            break;
+            /* Wait for WIFI_EVENT_SCAN_DONE with timeout */
+            if (xSemaphoreTake(s_scan_done_sem, pdMS_TO_TICKS(10000)) == pdTRUE) {
+                break;
+            } else {
+                ESP_LOGW(TAG, "Scan timeout on attempt %d", attempt + 1);
+                esp_wifi_scan_stop();
+                err = ESP_ERR_TIMEOUT;
+            }
+        } else {
+            ESP_LOGW(TAG, "Scan attempt %d failed (%s), retrying...", attempt + 1, esp_err_to_name(err));
         }
-        ESP_LOGW(TAG, "Scan attempt %d failed (%s), retrying...", attempt + 1, esp_err_to_name(err));
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Scan failed after retries: %s", esp_err_to_name(err));
-        if (switched_to_apsta) {
-            esp_wifi_set_mode(WIFI_MODE_AP);
-        }
         return err;
     }
 
@@ -568,9 +581,6 @@ esp_err_t wifi_manager_get_scan_results(char **out_json_str) {
     
     cJSON *root = cJSON_CreateArray();
     if (!root) {
-        if (switched_to_apsta) {
-            esp_wifi_set_mode(WIFI_MODE_AP);
-        }
         return ESP_ERR_NO_MEM;
     }
 
@@ -595,12 +605,6 @@ esp_err_t wifi_manager_get_scan_results(char **out_json_str) {
 
     char *json_txt = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
-
-    /* Restore original WiFi mode */
-    if (switched_to_apsta) {
-        esp_wifi_set_mode(WIFI_MODE_AP);
-        ESP_LOGD(TAG, "Restored WiFi mode to AP");
-    }
 
     if (json_txt) {
         *out_json_str = json_txt;
@@ -700,5 +704,48 @@ esp_err_t wifi_manager_delete_saved(const char *ssid)
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "Deleted WiFi from saved list: %s", ssid);
     }
+    return err;
+}
+
+esp_err_t wifi_manager_connect_to(const char *ssid, const char *password)
+{
+    if (!ssid || ssid[0] == '\0') return ESP_ERR_INVALID_ARG;
+    if (!password) password = "";
+
+    ESP_LOGI(TAG, "Switching WiFi to: %s", ssid);
+
+    /* Save to NVS as primary */
+    wifi_manager_set_credentials(ssid, password);
+
+    /* Reset connection state */
+    s_retry_count = 0;
+    s_connected = false;
+    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+
+    /* Configure STA */
+    wifi_config_t sta_cfg = {0};
+    strncpy((char *)sta_cfg.sta.ssid, ssid, sizeof(sta_cfg.sta.ssid) - 1);
+    strncpy((char *)sta_cfg.sta.password, password, sizeof(sta_cfg.sta.password) - 1);
+
+    /* Ensure we're in a mode that supports STA */
+    wifi_mode_t mode;
+    esp_wifi_get_mode(&mode);
+    if (mode == WIFI_MODE_AP) {
+        esp_wifi_set_mode(WIFI_MODE_APSTA);
+    }
+
+    /* If coming from config AP mode, we're now transitioning to STA connection */
+    s_is_config_ap_mode = false;
+
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    esp_wifi_set_config(WIFI_IF_STA, &sta_cfg);
+    esp_err_t err = esp_wifi_connect();
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start connection: %s", esp_err_to_name(err));
+    }
+
     return err;
 }

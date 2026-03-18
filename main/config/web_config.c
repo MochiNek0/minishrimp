@@ -186,13 +186,22 @@ static const char *CONFIG_HTML =
 "  const r=await fetch('/api/wifi/saved');const list=await r.json();\n"
 "  const el=document.getElementById('wifi_saved_list');\n"
 "  if(!list.length){el.innerHTML='<div class=\"wifi-empty\">No saved networks</div>';return;}\n"
-"  el.innerHTML=list.map(w=>'<div class=\"wifi-item\"><span class=\"wifi-item-name\"><svg fill=\"none\" viewBox=\"0 0 24 24\" stroke=\"currentColor\"><path stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-width=\"2\" d=\"M8.111 16.404a5.5 5.5 0 017.778 0M12 20h.01m-7.08-7.071c3.904-3.905 10.236-3.905 14.141 0M1.394 9.393c5.857-5.857 15.355-5.857 21.213 0\"/></svg>'+w.ssid+'</span><span class=\"wifi-item-actions\"><button class=\"btn-icon\" onclick=\"selectWiFi(\\''+w.ssid+'\\')\">Use</button><button class=\"btn-icon danger\" onclick=\"deleteWiFi(\\''+w.ssid+'\\')\">Delete</button></span></div>').join('');\n"
+"  el.innerHTML=list.map(w=>{var esc=w.ssid.split(\"'\").join(\"\\\\'\");return '<div class=\"wifi-item\"><span class=\"wifi-item-name\"><svg fill=\"none\" viewBox=\"0 0 24 24\" stroke=\"currentColor\"><path stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-width=\"2\" d=\"M8.111 16.404a5.5 5.5 0 017.778 0M12 20h.01m-7.08-7.071c3.904-3.905 10.236-3.905 14.141 0M1.394 9.393c5.857-5.857 15.355-5.857 21.213 0\"/></svg>'+w.ssid+'</span><span class=\"wifi-item-actions\"><button class=\"btn-icon\" onclick=\"useWiFi(\\''+esc+'\\')\" >Use</button><button class=\"btn-icon danger\" onclick=\"deleteWiFi(\\''+esc+'\\')\" >Delete</button></span></div>';}).join('');\n"
 " }catch(e){document.getElementById('wifi_saved_list').innerHTML='<div class=\"wifi-empty\">Failed to load</div>';}\n"
 "}\n"
-"function selectWiFi(ssid){\n"
-" if(!confirm('Connect to '+ssid+'?'))return;\n"
+"function useWiFi(ssid){\n"
+" var st=document.getElementById('wifi_scan_status');\n"
+" st.textContent='Connecting to '+ssid+'...';\n"
 " fetch('/api/wifi/use',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid:ssid})})\n"
-"  .then(r=>r.json()).then(d=>{if(d.ok){alert('Connecting to '+ssid+'...');}else{alert('Failed: '+(d.error||'unknown'));}}).catch(e=>alert('Error: '+e));\n"
+"  .then(function(r){return r.json();}).then(function(d){\n"
+"   if(d.ok){st.textContent='\\u2713 Connecting to '+ssid+'... Device will get new IP.';}\n"
+"   else{st.textContent='\\u2717 Failed: '+(d.error||'unknown');}\n"
+"  }).catch(function(e){st.textContent='\\u2717 Error: '+e;});\n"
+"}\n"
+"function selectWiFi(ssid){\n"
+" document.getElementById('wifi_ssid').value=ssid;\n"
+" document.getElementById('wifi_pass').value='';\n"
+" document.getElementById('wifi_pass').focus();\n"
 "}\n"
 "async function deleteWiFi(ssid){\n"
 " if(!confirm('Delete '+ssid+'?'))return;\n"
@@ -253,7 +262,9 @@ static const char *CONFIG_HTML =
 "}\n"
 "function selectWiFiFromScan(hex){\n"
 " const bytes=hexToBytes(hex);const name=bytesToUtf8(bytes);\n"
-" document.getElementById('wifi_ssid').value=name;document.getElementById('wifi_pass').focus();\n"
+" document.getElementById('wifi_ssid').value=name;\n"
+" document.getElementById('wifi_pass').value='';\n"
+" document.getElementById('wifi_pass').focus();\n"
 "}\n"
 "document.getElementById('wifi_scan_btn').addEventListener('click',e=>{e.preventDefault();scanWiFi();});\n"
 "async function saveConfig(restart){\n"
@@ -422,17 +433,22 @@ static esp_err_t handle_wifi_use(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    cJSON *ssid = cJSON_GetObjectItem(root, "ssid");
-    if (!ssid || !cJSON_IsString(ssid) || !ssid->valuestring[0]) {
+    cJSON *ssid_json = cJSON_GetObjectItem(root, "ssid");
+    if (!ssid_json || !cJSON_IsString(ssid_json) || !ssid_json->valuestring[0]) {
         cJSON_Delete(root);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "ssid required");
         return ESP_FAIL;
     }
 
+    /* Copy SSID to local buffer BEFORE freeing cJSON to avoid use-after-free */
+    char ssid_buf[33] = {0};
+    strncpy(ssid_buf, ssid_json->valuestring, sizeof(ssid_buf) - 1);
+    cJSON_Delete(root);
+
     /* Find password from saved WiFi list in NVS */
     nvs_handle_t nvs;
     char password[65] = {0};
-    esp_err_t err = ESP_FAIL;
+    bool found = false;
 
     if (nvs_open(SHRIMP_NVS_WIFI, NVS_READONLY, &nvs) == ESP_OK) {
         size_t len = 0;
@@ -448,10 +464,11 @@ static esp_err_t handle_wifi_use(httpd_req_t *req)
                         cJSON *item_ssid = cJSON_GetObjectItem(item, "ssid");
                         cJSON *item_pass = cJSON_GetObjectItem(item, "password");
                         if (item_ssid && cJSON_IsString(item_ssid) &&
-                            strcmp(item_ssid->valuestring, ssid->valuestring) == 0 &&
-                            item_pass && cJSON_IsString(item_pass)) {
-                            strncpy(password, item_pass->valuestring, sizeof(password) - 1);
-                            err = ESP_OK;
+                            strcmp(item_ssid->valuestring, ssid_buf) == 0) {
+                            if (item_pass && cJSON_IsString(item_pass)) {
+                                strncpy(password, item_pass->valuestring, sizeof(password) - 1);
+                            }
+                            found = true;
                             break;
                         }
                     }
@@ -463,23 +480,21 @@ static esp_err_t handle_wifi_use(httpd_req_t *req)
         nvs_close(nvs);
     }
 
-    cJSON_Delete(root);
-
-    if (err != ESP_OK || password[0] == '\0') {
+    if (!found) {
+        httpd_resp_set_type(req, "application/json");
         httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"WiFi not found in saved list\"}");
         return ESP_OK;
     }
 
-    /* Set credentials and reconnect */
-    wifi_manager_set_credentials(ssid->valuestring, password);
-
-    /* Disconnect and reconnect to apply new credentials */
-    esp_wifi_disconnect();
-    vTaskDelay(pdMS_TO_TICKS(500));
-    esp_wifi_connect();
+    /* Connect using the new connect_to API (handles disconnect + reconnect safely) */
+    esp_err_t err = wifi_manager_connect_to(ssid_buf, password);
 
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, "{\"ok\":true}");
+    if (err == ESP_OK) {
+        httpd_resp_sendstr(req, "{\"ok\":true}");
+    } else {
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Connection failed to start\"}");
+    }
     return ESP_OK;
 }
 

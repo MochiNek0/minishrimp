@@ -23,6 +23,7 @@ idf_component_register(
         "tools/tool_files.c"
         "tools/tool_weather.c"
         "skills/skill_loader.c"
+        "utils/string_utils.c"
     INCLUDE_DIRS
         "."
     REQUIRES

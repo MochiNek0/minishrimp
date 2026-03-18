@@ -1,6 +1,7 @@
 #include "tool_weather.h"
 #include "shrimp_config.h"
 #include "proxy/http_proxy.h"
+#include "utils/string_utils.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -107,6 +108,7 @@ static esp_err_t http_get(const char *url, char *response, size_t response_size,
             "GET %s HTTP/1.1\r\n"
             "Host: %s\r\n"
             "Accept: application/json\r\n"
+            "Accept-Encoding: identity\r\n"
             "Connection: close\r\n\r\n",
             path, host);
 
@@ -170,12 +172,15 @@ static esp_err_t http_get(const char *url, char *response, size_t response_size,
         proxy_conn_close(conn);
         response[hb.buffer_pos] = '\0';
 
+        ESP_LOGI(TAG, "Proxy response: status=%d, body_len=%d", *status_code, (int)hb.buffer_pos);
+
     } else {
         /* Direct HTTP request */
+        http_buffer_t hb = { .buffer = response, .buffer_size = response_size, .buffer_pos = 0 };
         esp_http_client_config_t config = {
             .url = url,
             .event_handler = http_buffer_event_handler,
-            .user_data = response,
+            .user_data = &hb,
             .timeout_ms = 15000,
             .buffer_size = WEATHER_BUF_SIZE,
             .crt_bundle_attach = esp_crt_bundle_attach,
@@ -231,58 +236,6 @@ static const char *weather_code_desc(int code)
         case 99: return "Thunderstorm with heavy hail";
         default: return "Unknown";
     }
-}
-
-/* ── Get location coordinates ────────────────────────────────────── */
-
-static bool get_coordinates(const char *city, double *lat, double *lon, char *country, size_t country_size)
-{
-    char url[512];
-    snprintf(url, sizeof(url), "%s?name=%s&count=1&language=en&format=json",
-             GEO_API_URL, city);
-
-    char response[WEATHER_BUF_SIZE] = {0};
-    int status = 0;
-
-    esp_err_t err = http_get(url, response, sizeof(response), &status);
-    if (err != ESP_OK || status >= 400) {
-        ESP_LOGE(TAG, "Geocoding API failed: err=%d, status=%d", err, status);
-        return false;
-    }
-
-    cJSON *root = cJSON_Parse(response);
-    if (!root) {
-        ESP_LOGE(TAG, "Failed to parse geocoding response");
-        return false;
-    }
-
-    cJSON *results = cJSON_GetObjectItem(root, "results");
-    if (!results || !cJSON_GetArraySize(results)) {
-        ESP_LOGE(TAG, "No results found for city: %s", city);
-        cJSON_Delete(root);
-        return false;
-    }
-
-    cJSON *first = cJSON_GetArrayItem(results, 0);
-    cJSON *lat_item = cJSON_GetObjectItem(first, "latitude");
-    cJSON *lon_item = cJSON_GetObjectItem(first, "longitude");
-    cJSON *country_item = cJSON_GetObjectItem(first, "country");
-
-    if (!lat_item || !lon_item) {
-        ESP_LOGE(TAG, "Missing coordinates in response");
-        cJSON_Delete(root);
-        return false;
-    }
-
-    *lat = lat_item->valuedouble;
-    *lon = lon_item->valuedouble;
-
-    if (country_item && country_item->valuestring) {
-        strncpy(country, country_item->valuestring, country_size - 1);
-    }
-
-    cJSON_Delete(root);
-    return true;
 }
 
 /* ── Get weather data (current only) ───────────────────────────────── */
@@ -546,21 +499,31 @@ esp_err_t tool_weather_init(void)
 
 esp_err_t tool_weather_execute(const char *input_json, char *output, size_t output_size)
 {
-    /* Parse input to get city name */
+    /* Parse input */
     cJSON *input = cJSON_Parse(input_json);
     if (!input) {
         snprintf(output, output_size, "Error: Invalid input JSON");
         return ESP_ERR_INVALID_ARG;
     }
 
+    /* Check if latitude and longitude are provided directly */
+    cJSON *lat_item = cJSON_GetObjectItem(input, "latitude");
+    cJSON *lon_item = cJSON_GetObjectItem(input, "longitude");
     cJSON *city_item = cJSON_GetObjectItem(input, "city");
-    if (!city_item || !cJSON_IsString(city_item) || city_item->valuestring[0] == '\0') {
+
+    double lat = 0, lon = 0;
+    bool has_coords = false;
+
+    if (lat_item && lon_item && cJSON_IsNumber(lat_item) && cJSON_IsNumber(lon_item)) {
+        lat = lat_item->valuedouble;
+        lon = lon_item->valuedouble;
+        has_coords = true;
+        ESP_LOGI(TAG, "Using provided coordinates: %.4f, %.4f", lat, lon);
+    } else if (!city_item || !cJSON_IsString(city_item) || city_item->valuestring[0] == '\0') {
         cJSON_Delete(input);
-        snprintf(output, output_size, "Error: Missing 'city' field");
+        snprintf(output, output_size, "Error: Please provide either city name or latitude/longitude coordinates");
         return ESP_ERR_INVALID_ARG;
     }
-
-    const char *city = city_item->valuestring;
 
     /* Parse optional date parameters */
     cJSON *start_date_item = cJSON_GetObjectItem(input, "start_date");
@@ -576,46 +539,154 @@ esp_err_t tool_weather_execute(const char *input_json, char *output, size_t outp
         end_date = end_date_item->valuestring;
     }
 
-    ESP_LOGI(TAG, "Getting weather for city: %s, start_date: %s, end_date: %s",
-             city, start_date ? start_date : "none", end_date ? end_date : "none");
+    /* If no coordinates, search for city */
+    if (!has_coords) {
+        const char *city = city_item->valuestring;
+        ESP_LOGI(TAG, "Searching for city: %s", city);
 
-    /* Get coordinates */
-    double lat, lon;
-    char country[64] = {0};
+        /* URL-encode the city name */
+        char encoded_city[256];
+        url_encode(city, encoded_city, sizeof(encoded_city));
 
-    if (!get_coordinates(city, &lat, &lon, country, sizeof(country))) {
-        cJSON_Delete(input);
-        snprintf(output, output_size, "Error: Could not find city '%s'. Please check the city name.", city);
-        return ESP_FAIL;
+        /* Request multiple results */
+        char url[512];
+        snprintf(url, sizeof(url), "%s?name=%s&count=10&language=en&format=json",
+                 GEO_API_URL, encoded_city);
+
+        ESP_LOGI(TAG, "Geocoding URL: %s", url);
+
+        char response[WEATHER_BUF_SIZE] = {0};
+        int status = 0;
+
+        esp_err_t err = http_get(url, response, sizeof(response), &status);
+        if (err != ESP_OK || status >= 400) {
+            ESP_LOGE(TAG, "Geocoding API failed: err=%d, status=%d", err, status);
+            cJSON_Delete(input);
+            snprintf(output, output_size, "Error: Failed to search for city '%s'", city);
+            return ESP_FAIL;
+        }
+
+        cJSON *root = cJSON_Parse(response);
+        if (!root) {
+            cJSON_Delete(input);
+            snprintf(output, output_size, "Error: Failed to parse geocoding response");
+            return ESP_FAIL;
+        }
+
+        cJSON *results = cJSON_GetObjectItem(root, "results");
+        if (!results) {
+            cJSON_Delete(root);
+            cJSON_Delete(input);
+            snprintf(output, output_size, "Error: Could not find city '%s'. Try using English name (e.g., 'Hangzhou' instead of '杭州').", city);
+            return ESP_FAIL;
+        }
+
+        int count = cJSON_GetArraySize(results);
+        if (count == 0) {
+            cJSON_Delete(root);
+            cJSON_Delete(input);
+            snprintf(output, output_size, "Error: No results found for '%s'. Try using English city name.", city);
+            return ESP_FAIL;
+        }
+
+        /* Return candidates for AI to choose */
+        if (count > 1) {
+            char *buf = output;
+            size_t remaining = output_size;
+            int offset = snprintf(buf, remaining,
+                "Found %d locations matching '%s'. Please choose one by calling this tool again with latitude and longitude:\n\n",
+                count, city);
+            buf += offset;
+            remaining -= offset;
+
+            for (int i = 0; i < count && remaining > 50; i++) {
+                cJSON *item = cJSON_GetArrayItem(results, i);
+                if (!item) continue;
+
+                cJSON *name = cJSON_GetObjectItem(item, "name");
+                cJSON *admin1 = cJSON_GetObjectItem(item, "admin1");
+                cJSON *country = cJSON_GetObjectItem(item, "country");
+                cJSON *lat_r = cJSON_GetObjectItem(item, "latitude");
+                cJSON *lon_r = cJSON_GetObjectItem(item, "longitude");
+
+                offset = snprintf(buf, remaining, "%d. %s",
+                    i + 1,
+                    name && name->valuestring ? name->valuestring : city);
+                buf += offset;
+                remaining -= offset;
+
+                if (admin1 && admin1->valuestring) {
+                    offset = snprintf(buf, remaining, ", %s", admin1->valuestring);
+                    buf += offset;
+                    remaining -= offset;
+                }
+                if (country && country->valuestring) {
+                    offset = snprintf(buf, remaining, ", %s", country->valuestring);
+                    buf += offset;
+                    remaining -= offset;
+                }
+
+                if (lat_r && lon_r) {
+                    offset = snprintf(buf, remaining, " [lat: %.4f, lon: %.4f]\n",
+                                     lat_r->valuedouble, lon_r->valuedouble);
+                } else {
+                    offset = snprintf(buf, remaining, "\n");
+                }
+                buf += offset;
+                remaining -= offset;
+            }
+
+            cJSON_Delete(root);
+            cJSON_Delete(input);
+            return ESP_OK;
+        }
+
+        /* Single result - use it directly */
+        cJSON *first = cJSON_GetArrayItem(results, 0);
+        cJSON *lat_r = cJSON_GetObjectItem(first, "latitude");
+        cJSON *lon_r = cJSON_GetObjectItem(first, "longitude");
+
+        if (!lat_r || !lon_r) {
+            cJSON_Delete(root);
+            cJSON_Delete(input);
+            snprintf(output, output_size, "Error: Missing coordinates in response");
+            return ESP_FAIL;
+        }
+
+        lat = lat_r->valuedouble;
+        lon = lon_r->valuedouble;
+
+        cJSON *name = cJSON_GetObjectItem(first, "name");
+        cJSON *admin1 = cJSON_GetObjectItem(first, "admin1");
+        cJSON *country = cJSON_GetObjectItem(first, "country");
+
+        ESP_LOGI(TAG, "Found single match: %s, %s, %s (%.4f, %.4f)",
+                 name ? name->valuestring : city,
+                 admin1 ? admin1->valuestring : "",
+                 country ? country->valuestring : "",
+                 lat, lon);
+
+        cJSON_Delete(root);
     }
 
-    ESP_LOGI(TAG, "Found coordinates: %.4f, %.4f (%s)", lat, lon, country);
-
+    /* Get weather data */
     char weather_data[WEATHER_BUF_SIZE];
     bool success;
 
-    /* Check if we have date parameters for forecast */
     if (start_date && end_date) {
         success = get_weather_forecast(lat, lon, start_date, end_date, weather_data, sizeof(weather_data));
     } else {
-        /* Default to current weather */
         success = get_weather_current(lat, lon, weather_data, sizeof(weather_data));
     }
 
     if (!success) {
         cJSON_Delete(input);
-        snprintf(output, output_size, "Error: Failed to fetch weather data for '%s'", city);
+        snprintf(output, output_size, "Error: Failed to fetch weather data");
         return ESP_FAIL;
     }
 
-    /* Build final output with location info */
-    if (country[0]) {
-        snprintf(output, output_size, "%s, %s\n\n%s",
-                 city, country, weather_data);
-    } else {
-        snprintf(output, output_size, "%s\n\n%s",
-                 city, weather_data);
-    }
+    /* Build final output */
+    filter_valid_utf8(weather_data, output, output_size);
     output[output_size - 1] = '\0';
 
     cJSON_Delete(input);

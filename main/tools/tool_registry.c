@@ -194,16 +194,22 @@ esp_err_t tool_registry_init(void)
     tool_weather_init();
     shrimp_tool_t gw = {
         .name = "get_weather",
-        .description = "Get current weather or forecast for a city. Use this when the user asks about the weather in a specific location. "
+        .description = "Get current weather or forecast for a city. "
+        "IMPORTANT: The city parameter must be a simple English city name (e.g., 'Hangzhou', not '杭州' or 'Hangzhou, Zhejiang'). "
+        "If the user provides a non-English city name, translate it to English Pinyin first. "
+        "When you call this tool, it may return multiple location candidates. "
+        "You should then call this tool again with latitude and longitude of the correct location. "
         "Optional: provide start_date and end_date (YYYY-MM-DD format) for multi-day forecast.",
         .input_schema_json =
             "{\"type\":\"object\","
             "\"properties\":{"
-            "\"city\":{\"type\":\"string\",\"description\":\"City name (e.g. Beijing, Shanghai, Tokyo)\"},"
+            "\"city\":{\"type\":\"string\",\"description\":\"Simple English city name only (e.g., Hangzhou, Beijing, Tokyo). Do NOT include province or country.\"},"
+            "\"latitude\":{\"type\":\"number\",\"description\":\"Latitude coordinate (optional, use this if you know the exact location from previous search)\"},"
+            "\"longitude\":{\"type\":\"number\",\"description\":\"Longitude coordinate (optional, use this if you know the exact location from previous search)\"},"
             "\"start_date\":{\"type\":\"string\",\"description\":\"Start date for forecast (YYYY-MM-DD, optional)\"},"
             "\"end_date\":{\"type\":\"string\",\"description\":\"End date for forecast (YYYY-MM-DD, optional)\"}"
             "},"
-            "\"required\":[\"city\"]}",
+            "\"required\":[]}",
         .execute = tool_weather_execute,
     };
     register_tool(&gw);

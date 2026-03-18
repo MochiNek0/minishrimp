@@ -20,6 +20,17 @@ static bool s_connected = false;
 static char s_current_ssid[33] = {0};
 static char s_current_pass[65] = {0};
 
+#define WIFI_CANDIDATE_MAX  10
+
+typedef struct {
+    char ssid[33];
+    char pass[65];
+} wifi_candidate_t;
+
+static wifi_candidate_t s_candidates[WIFI_CANDIDATE_MAX];
+static int s_candidate_count = 0;
+static int s_current_candidate_idx = 0;
+
 /* Hex utilities for Chinese SSIDs */
 static void bytes_to_hex(const uint8_t *in, size_t in_len, char *out) {
     static const char hex[] = "0123456789abcdef";
@@ -79,9 +90,29 @@ static void event_handler(void *arg, esp_event_base_t event_base,
             
             s_retry_count++;
         } else {
-            ESP_LOGE(TAG, "Failed to connect after %d retries", SHRIMP_WIFI_MAX_RETRY);
-            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-            /* Consider triggering fallback to AP or next WiFi here if needed */
+            ESP_LOGE(TAG, "Failed to connect to %s after %d retries", s_current_ssid, SHRIMP_WIFI_MAX_RETRY);
+            
+            if (s_current_candidate_idx + 1 < s_candidate_count) {
+                s_current_candidate_idx++;
+                s_retry_count = 0;
+                
+                strncpy(s_current_ssid, s_candidates[s_current_candidate_idx].ssid, sizeof(s_current_ssid)-1);
+                strncpy(s_current_pass, s_candidates[s_current_candidate_idx].pass, sizeof(s_current_pass)-1);
+                
+                ESP_LOGI(TAG, "Trying next candidate (%d/%d): %s", 
+                         s_current_candidate_idx + 1, s_candidate_count, s_current_ssid);
+                
+                wifi_config_t next_cfg = {0};
+                strncpy((char *)next_cfg.sta.ssid, s_current_ssid, sizeof(next_cfg.sta.ssid)-1);
+                strncpy((char *)next_cfg.sta.password, s_current_pass, sizeof(next_cfg.sta.password)-1);
+                
+                esp_wifi_set_config(WIFI_IF_STA, &next_cfg);
+                esp_wifi_connect();
+            } else {
+                ESP_LOGE(TAG, "All candidates failed.");
+                xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+                /* Consider triggering fallback to AP here if needed */
+            }
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
@@ -179,7 +210,6 @@ esp_err_t wifi_manager_init(void)
 esp_err_t wifi_manager_start(void)
 {
     wifi_config_t wifi_cfg = {0};
-    bool found_and_connected = false;
 
     /* Scan surrounding APs to match with NVS list */
     ESP_LOGI(TAG, "Starting boot-time WiFi scan...");
@@ -201,8 +231,11 @@ esp_err_t wifi_manager_start(void)
         ESP_LOGE(TAG, "Boot-time WiFi scan failed: %s", esp_err_to_name(err));
     }
 
-    /* 1. Try to connect using the NVS WiFi list */
+    /* 1. Collect all nearby networks from the NVS WiFi list */
     nvs_handle_t nvs;
+    s_candidate_count = 0;
+    s_current_candidate_idx = 0;
+
     if (nvs_open(SHRIMP_NVS_WIFI, NVS_READONLY, &nvs) == ESP_OK) {
         size_t len = 0;
         char *json_str = NULL;
@@ -212,15 +245,13 @@ esp_err_t wifi_manager_start(void)
                 cJSON *list = cJSON_Parse(json_str);
                 if (list && cJSON_IsArray(list)) {
                     int array_sz = cJSON_GetArraySize(list);
-                    for (int i = 0; i < array_sz && !found_and_connected; i++) {
+                    for (int i = 0; i < array_sz && s_candidate_count < WIFI_CANDIDATE_MAX; i++) {
                         cJSON *item = cJSON_GetArrayItem(list, i);
                         cJSON *ssid = cJSON_GetObjectItem(item, "ssid");
                         cJSON *pass = cJSON_GetObjectItem(item, "password");
                         
                         if (ssid && cJSON_IsString(ssid) && pass && cJSON_IsString(pass)) {
-                            /* Verify if this SSID is nearby */
                             bool is_nearby = false;
-                            /* If scan failed, we blindly try the first one anyway */
                             if (!ap_list || ap_count == 0) {
                                 is_nearby = true;
                             } else {
@@ -233,10 +264,9 @@ esp_err_t wifi_manager_start(void)
                             }
                             
                             if (is_nearby) {
-                                strncpy((char *)wifi_cfg.sta.ssid, ssid->valuestring, sizeof(wifi_cfg.sta.ssid)-1);
-                                strncpy((char *)wifi_cfg.sta.password, pass->valuestring, sizeof(wifi_cfg.sta.password)-1);
-                                found_and_connected = true;
-                                ESP_LOGI(TAG, "Selected nearby network from list: %s", ssid->valuestring);
+                                strncpy(s_candidates[s_candidate_count].ssid, ssid->valuestring, 32);
+                                strncpy(s_candidates[s_candidate_count].pass, pass->valuestring, 64);
+                                s_candidate_count++;
                             }
                         }
                     }
@@ -247,40 +277,56 @@ esp_err_t wifi_manager_start(void)
         }
         
         /* Backward compatibility with single legacy connection */
-        if (!found_and_connected) {
-            len = sizeof(wifi_cfg.sta.ssid);
-            if (nvs_get_str(nvs, SHRIMP_NVS_KEY_SSID, (char *)wifi_cfg.sta.ssid, &len) == ESP_OK && wifi_cfg.sta.ssid[0] != '\0') {
-                len = sizeof(wifi_cfg.sta.password);
-                nvs_get_str(nvs, SHRIMP_NVS_KEY_PASS, (char *)wifi_cfg.sta.password, &len);
-                found_and_connected = true;
-                ESP_LOGI(TAG, "Selected legacy NVS network: %s", wifi_cfg.sta.ssid);
+        if (s_candidate_count == 0) {
+            char legacy_ssid[33] = {0};
+            char legacy_pass[65] = {0};
+            len = sizeof(legacy_ssid);
+            if (nvs_get_str(nvs, SHRIMP_NVS_KEY_SSID, legacy_ssid, &len) == ESP_OK && legacy_ssid[0] != '\0') {
+                len = sizeof(legacy_pass);
+                nvs_get_str(nvs, SHRIMP_NVS_KEY_PASS, legacy_pass, &len);
+                strncpy(s_candidates[s_candidate_count].ssid, legacy_ssid, 32);
+                strncpy(s_candidates[s_candidate_count].pass, legacy_pass, 64);
+                s_candidate_count++;
             }
         }
         
         nvs_close(nvs);
     }
 
-    if (ap_list) free(ap_list);
-
-    /* 2. Fall back to build-time secrets */
-    if (!found_and_connected) {
-        if (SHRIMP_SECRET_WIFI_SSID[0] != '\0') {
-            strncpy((char *)wifi_cfg.sta.ssid, SHRIMP_SECRET_WIFI_SSID, sizeof(wifi_cfg.sta.ssid) - 1);
-            strncpy((char *)wifi_cfg.sta.password, SHRIMP_SECRET_WIFI_PASS, sizeof(wifi_cfg.sta.password) - 1);
-            found_and_connected = true;
-            ESP_LOGI(TAG, "Selected build-time network: %s", wifi_cfg.sta.ssid);
+    /* 2. Collect build-time secrets if not already in list or as fallback */
+    if (SHRIMP_SECRET_WIFI_SSID[0] != '\0' && s_candidate_count < WIFI_CANDIDATE_MAX) {
+        bool already_added = false;
+        for (int i = 0; i < s_candidate_count; i++) {
+            if (strcmp(s_candidates[i].ssid, SHRIMP_SECRET_WIFI_SSID) == 0) {
+                already_added = true;
+                break;
+            }
+        }
+        if (!already_added) {
+            strncpy(s_candidates[s_candidate_count].ssid, SHRIMP_SECRET_WIFI_SSID, 32);
+            strncpy(s_candidates[s_candidate_count].pass, SHRIMP_SECRET_WIFI_PASS, 64);
+            s_candidate_count++;
         }
     }
 
-    if (!found_and_connected) {
+    if (s_candidate_count == 0) {
+        if (ap_list) free(ap_list);
         ESP_LOGW(TAG, "No WiFi credentials available. Use AP to configure.");
         return ESP_ERR_NOT_FOUND;
     }
 
-    ESP_LOGI(TAG, "Connecting to SSID: %s", wifi_cfg.sta.ssid);
-    
-    strncpy(s_current_ssid, (const char *)wifi_cfg.sta.ssid, sizeof(s_current_ssid)-1);
-    strncpy(s_current_pass, (const char *)wifi_cfg.sta.password, sizeof(s_current_pass)-1);
+    if (ap_list) free(ap_list);
+
+    /* 3. Start connecting to the first candidate */
+    strncpy(s_current_ssid, s_candidates[0].ssid, sizeof(s_current_ssid)-1);
+    strncpy(s_current_pass, s_candidates[0].pass, sizeof(s_current_pass)-1);
+    s_current_candidate_idx = 0;
+
+    strncpy((char *)wifi_cfg.sta.ssid, s_current_ssid, sizeof(wifi_cfg.sta.ssid)-1);
+    strncpy((char *)wifi_cfg.sta.password, s_current_pass, sizeof(wifi_cfg.sta.password)-1);
+
+    ESP_LOGI(TAG, "Starting connection sequence with %d candidates. Primary: %s", 
+             s_candidate_count, s_current_ssid);
 
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
@@ -367,6 +413,12 @@ esp_err_t wifi_manager_set_credentials(const char *ssid, const char *password)
     s_current_ssid[sizeof(s_current_ssid)-1] = '\0';
     strncpy(s_current_pass, password, sizeof(s_current_pass)-1);
     s_current_pass[sizeof(s_current_pass)-1] = '\0';
+
+    /* Reset candidates and make this the only one for now */
+    strncpy(s_candidates[0].ssid, ssid, 32);
+    strncpy(s_candidates[0].pass, password, 64);
+    s_candidate_count = 1;
+    s_current_candidate_idx = 0;
 
     return ESP_OK;
 }

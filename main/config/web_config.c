@@ -14,6 +14,7 @@
 #include "esp_log.h"
 #include "esp_http_server.h"
 #include "esp_system.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs.h"
@@ -188,7 +189,11 @@ static const char *CONFIG_HTML =
 "  el.innerHTML=list.map(w=>'<div class=\"wifi-item\"><span class=\"wifi-item-name\"><svg fill=\"none\" viewBox=\"0 0 24 24\" stroke=\"currentColor\"><path stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-width=\"2\" d=\"M8.111 16.404a5.5 5.5 0 017.778 0M12 20h.01m-7.08-7.071c3.904-3.905 10.236-3.905 14.141 0M1.394 9.393c5.857-5.857 15.355-5.857 21.213 0\"/></svg>'+w.ssid+'</span><span class=\"wifi-item-actions\"><button class=\"btn-icon\" onclick=\"selectWiFi(\\''+w.ssid+'\\')\">Use</button><button class=\"btn-icon danger\" onclick=\"deleteWiFi(\\''+w.ssid+'\\')\">Delete</button></span></div>').join('');\n"
 " }catch(e){document.getElementById('wifi_saved_list').innerHTML='<div class=\"wifi-empty\">Failed to load</div>';}\n"
 "}\n"
-"function selectWiFi(ssid){document.getElementById('wifi_ssid').value=ssid;document.getElementById('wifi_pass').focus();}\n"
+"function selectWiFi(ssid){\n"
+" if(!confirm('Connect to '+ssid+'?'))return;\n"
+" fetch('/api/wifi/use',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid:ssid})})\n"
+"  .then(r=>r.json()).then(d=>{if(d.ok){alert('Connecting to '+ssid+'...');}else{alert('Failed: '+(d.error||'unknown'));}}).catch(e=>alert('Error: '+e));\n"
+"}\n"
 "async function deleteWiFi(ssid){\n"
 " if(!confirm('Delete '+ssid+'?'))return;\n"
 " try{\n"
@@ -387,6 +392,94 @@ static esp_err_t handle_wifi_delete(httpd_req_t *req)
     } else {
         httpd_resp_sendstr(req, "{\"ok\":false}");
     }
+    return ESP_OK;
+}
+
+static esp_err_t handle_wifi_use(httpd_req_t *req)
+{
+    if (req->content_len > 256) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "payload too large");
+        return ESP_FAIL;
+    }
+
+    char *buf = calloc(1, req->content_len + 1);
+    if (!buf) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no mem");
+        return ESP_FAIL;
+    }
+
+    int received = httpd_req_recv(req, buf, req->content_len);
+    if (received <= 0) {
+        free(buf);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid body");
+        return ESP_FAIL;
+    }
+
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid json");
+        return ESP_FAIL;
+    }
+
+    cJSON *ssid = cJSON_GetObjectItem(root, "ssid");
+    if (!ssid || !cJSON_IsString(ssid) || !ssid->valuestring[0]) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "ssid required");
+        return ESP_FAIL;
+    }
+
+    /* Find password from saved WiFi list in NVS */
+    nvs_handle_t nvs;
+    char password[65] = {0};
+    esp_err_t err = ESP_FAIL;
+
+    if (nvs_open(SHRIMP_NVS_WIFI, NVS_READONLY, &nvs) == ESP_OK) {
+        size_t len = 0;
+        char *json_str = NULL;
+        if (nvs_get_str(nvs, SHRIMP_NVS_KEY_WIFI_LIST, NULL, &len) == ESP_OK && len > 0) {
+            json_str = malloc(len);
+            if (json_str && nvs_get_str(nvs, SHRIMP_NVS_KEY_WIFI_LIST, json_str, &len) == ESP_OK) {
+                cJSON *list = cJSON_Parse(json_str);
+                if (list && cJSON_IsArray(list)) {
+                    int sz = cJSON_GetArraySize(list);
+                    for (int i = 0; i < sz; i++) {
+                        cJSON *item = cJSON_GetArrayItem(list, i);
+                        cJSON *item_ssid = cJSON_GetObjectItem(item, "ssid");
+                        cJSON *item_pass = cJSON_GetObjectItem(item, "password");
+                        if (item_ssid && cJSON_IsString(item_ssid) &&
+                            strcmp(item_ssid->valuestring, ssid->valuestring) == 0 &&
+                            item_pass && cJSON_IsString(item_pass)) {
+                            strncpy(password, item_pass->valuestring, sizeof(password) - 1);
+                            err = ESP_OK;
+                            break;
+                        }
+                    }
+                    cJSON_Delete(list);
+                }
+            }
+            if (json_str) free(json_str);
+        }
+        nvs_close(nvs);
+    }
+
+    cJSON_Delete(root);
+
+    if (err != ESP_OK || password[0] == '\0') {
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"WiFi not found in saved list\"}");
+        return ESP_OK;
+    }
+
+    /* Set credentials and reconnect */
+    wifi_manager_set_credentials(ssid->valuestring, password);
+
+    /* Disconnect and reconnect to apply new credentials */
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_wifi_connect();
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
     return ESP_OK;
 }
 
@@ -745,12 +838,20 @@ esp_err_t web_config_register(httpd_handle_t server)
         .user_ctx = NULL
     };
 
+    httpd_uri_t wifi_use = {
+        .uri = "/api/wifi/use",
+        .method = HTTP_POST,
+        .handler = handle_wifi_use,
+        .user_ctx = NULL
+    };
+
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &page));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &get_cfg));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &post_cfg));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wifi_scan));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wifi_saved));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wifi_delete));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wifi_use));
 
     ESP_LOGI(TAG, "Config UI available at /config");
     return ESP_OK;

@@ -5,6 +5,7 @@
 #include "llm/llm_proxy.h"
 #include "memory/session_mgr.h"
 #include "tools/tool_registry.h"
+#include "utils/string_utils.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -151,11 +152,23 @@ static cJSON *build_tool_results(const llm_response_t *resp, const shrimp_msg_t 
         }
 
         /* Execute tool */
-        tool_output[0] = '\0';
-        tool_registry_execute(call->name, tool_input, tool_output, tool_output_size);
+        char *raw_output = heap_caps_calloc(1, tool_output_size, MALLOC_CAP_SPIRAM);
+        if (raw_output) {
+            tool_registry_execute(call->name, tool_input, raw_output, tool_output_size);
+            filter_valid_utf8(raw_output, tool_output, tool_output_size);
+            free(raw_output);
+        } else {
+            tool_registry_execute(call->name, tool_input, tool_output, tool_output_size);
+            /* In-place filter if no PSRAM available */
+            char *tmp = strdup(tool_output);
+            if (tmp) {
+                filter_valid_utf8(tmp, tool_output, tool_output_size);
+                free(tmp);
+            }
+        }
         free(patched_input);
 
-        ESP_LOGI(TAG, "Tool %s result: %d bytes", call->name, (int)strlen(tool_output));
+        ESP_LOGI(TAG, "Tool %s result: %d bytes (sanitized)", call->name, (int)strlen(tool_output));
 
         /* Build tool_result block */
         cJSON *result_block = cJSON_CreateObject();

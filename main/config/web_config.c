@@ -171,6 +171,7 @@ static const char *CONFIG_HTML =
 "</main>\n"
 "<script>\n"
 "const statusEl=document.getElementById('status');\n"
+"var lastScanSSIDs=null;\n"
 "function togglePwd(btn){\n"
 " const input=btn.previousElementSibling;const path=btn.querySelector('path');\n"
 " if(input.type==='password'){input.type='text';path.setAttribute('d','M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-10-7-10-7a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 10 7 10 7a18.14 18.14 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24M1 1l22 22');}\n"
@@ -181,12 +182,14 @@ static const char *CONFIG_HTML =
 " el.className='badge '+(ok?'ok':'warn');\n"
 " el.textContent=ok?'\\u2713 Configured':'Empty';\n"
 "}\n"
-"async function loadSavedWiFi(){\n"
+"async function loadSavedWiFi(scanSSIDs){\n"
 " try{\n"
 "  const r=await fetch('/api/wifi/saved');const list=await r.json();\n"
 "  const el=document.getElementById('wifi_saved_list');\n"
-"  if(!list.length){el.innerHTML='<div class=\"wifi-empty\">No saved networks</div>';return;}\n"
-"  el.innerHTML=list.map(w=>{var esc=w.ssid.split(\"'\").join(\"\\\\'\");return '<div class=\"wifi-item\"><span class=\"wifi-item-name\"><svg fill=\"none\" viewBox=\"0 0 24 24\" stroke=\"currentColor\"><path stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-width=\"2\" d=\"M8.111 16.404a5.5 5.5 0 017.778 0M12 20h.01m-7.08-7.071c3.904-3.905 10.236-3.905 14.141 0M1.394 9.393c5.857-5.857 15.355-5.857 21.213 0\"/></svg>'+w.ssid+'</span><span class=\"wifi-item-actions\"><button class=\"btn-icon\" onclick=\"useWiFi(\\''+esc+'\\')\" >Use</button><button class=\"btn-icon danger\" onclick=\"deleteWiFi(\\''+esc+'\\')\" >Delete</button></span></div>';}).join('');\n"
+"  var filtered=list;\n"
+"  if(scanSSIDs){filtered=list.filter(function(w){return scanSSIDs.has(w.ssid);});}\n"
+"  if(!filtered.length){el.innerHTML='<div class=\"wifi-empty\">'+(scanSSIDs?'No saved networks nearby':'No saved networks')+'</div>';return;}\n"
+"  el.innerHTML=filtered.map(w=>{var esc=w.ssid.split(\"'\").join(\"\\\\'\");return '<div class=\"wifi-item\"><span class=\"wifi-item-name\"><svg fill=\"none\" viewBox=\"0 0 24 24\" stroke=\"currentColor\"><path stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-width=\"2\" d=\"M8.111 16.404a5.5 5.5 0 017.778 0M12 20h.01m-7.08-7.071c3.904-3.905 10.236-3.905 14.141 0M1.394 9.393c5.857-5.857 15.355-5.857 21.213 0\"/></svg>'+w.ssid+'</span><span class=\"wifi-item-actions\"><button class=\"btn-icon\" onclick=\"useWiFi(\\''+esc+'\\')\" >Use</button><button class=\"btn-icon danger\" onclick=\"deleteWiFi(\\''+esc+'\\')\" >Delete</button></span></div>';}).join('');\n"
 " }catch(e){document.getElementById('wifi_saved_list').innerHTML='<div class=\"wifi-empty\">Failed to load</div>';}\n"
 "}\n"
 "function useWiFi(ssid){\n"
@@ -207,7 +210,7 @@ static const char *CONFIG_HTML =
 " if(!confirm('Delete '+ssid+'?'))return;\n"
 " try{\n"
 "  const r=await fetch('/api/wifi/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid:ssid})});\n"
-"  if(r.ok){loadSavedWiFi();}\n"
+"  if(r.ok){loadSavedWiFi(lastScanSSIDs);}\n"
 " }catch(e){}\n"
 "}\n"
 "async function loadConfig(){\n"
@@ -234,7 +237,7 @@ static const char *CONFIG_HTML =
 "  setBadge(document.getElementById('api_key_status'),c.api_key_set);\n"
 "  setBadge(document.getElementById('search_status'),c.search_key_set);\n"
 "  setBadge(document.getElementById('tavily_status'),c.tavily_key_set);\n"
-"  loadSavedWiFi();\n"
+"  scanWiFi();\n"
 " }catch(e){\n"
 "  statusEl.className='status warn';statusEl.textContent='Load failed';\n"
 " }\n"
@@ -246,17 +249,24 @@ static const char *CONFIG_HTML =
 " const sp=document.getElementById('wifi_spinner');const listEl=document.getElementById('wifi_scan_list');\n"
 " btn.disabled=true;sp.className='spinner active';st.textContent='Scanning nearby networks...';\n"
 " try{\n"
-"  const r=await fetch('/api/wifi/scan');const list=await r.json();\n"
-"  if(!list.length){listEl.innerHTML='<div class=\"wifi-empty\">No networks found</div>';}else{\n"
-"  list.sort((a,b)=>b.rssi-a.rssi);\n"
-"  listEl.innerHTML=list.map(ap=>{\n"
+"  const r=await fetch('/api/wifi/scan');const scanList=await r.json();\n"
+"  var allScanNames=new Set();\n"
+"  scanList.forEach(function(ap){var b=hexToBytes(ap.ssid_hex);var n=bytesToUtf8(b);if(n)allScanNames.add(n);});\n"
+"  lastScanSSIDs=allScanNames;\n"
+"  var savedR=await fetch('/api/wifi/saved');var savedList=await savedR.json();\n"
+"  var savedSSIDs=new Set();savedList.forEach(function(w){if(w.ssid)savedSSIDs.add(w.ssid);});\n"
+"  var filtered=scanList.filter(function(ap){var b=hexToBytes(ap.ssid_hex);var n=bytesToUtf8(b);return n&&!savedSSIDs.has(n);});\n"
+"  if(!filtered.length){listEl.innerHTML='<div class=\"wifi-empty\">No new networks found</div>';}else{\n"
+"  filtered.sort((a,b)=>b.rssi-a.rssi);\n"
+"  listEl.innerHTML=filtered.map(ap=>{\n"
 "   const bytes=hexToBytes(ap.ssid_hex);const name=bytesToUtf8(bytes);\n"
 "   const bars=ap.rssi>-50?4:ap.rssi>-65?3:ap.rssi>-75?2:ap.rssi>-85?1:0;\n"
 "   let barHtml='<div class=\"sig-bars\">';for(let i=1;i<=4;i++)barHtml+='<span class=\"sig-'+i+' '+(i<=bars?'active':'')+'\"></span>';barHtml+='</div>';\n"
 "   return '<div class=\"wifi-item\"><span class=\"wifi-item-name\">'+barHtml+'<b>'+name+'</b> <small style=\"color:var(--text-muted);font-size:11px\">('+ap.rssi+'dBm)</small></span><button class=\"btn-icon\" onclick=\"selectWiFiFromScan(\\''+ap.ssid_hex+'\\')\">Select</button></div>';\n"
 "  }).join('');\n"
 "  }\n"
-"  st.textContent='Found '+list.length+' networks.';\n"
+"  st.textContent='Found '+scanList.length+' networks ('+filtered.length+' new).';\n"
+"  loadSavedWiFi(allScanNames);\n"
 " }catch(e){st.textContent='Scan failed. Retry in a moment.';listEl.innerHTML='<div class=\"wifi-empty\">Failed to scan</div>';}\n"
 " btn.disabled=false;sp.className='spinner';\n"
 "}\n"
@@ -486,15 +496,30 @@ static esp_err_t handle_wifi_use(httpd_req_t *req)
         return ESP_OK;
     }
 
-    /* Connect using the new connect_to API (handles disconnect + reconnect safely) */
-    esp_err_t err = wifi_manager_connect_to(ssid_buf, password);
-
+    /* Send response BEFORE switching WiFi so the browser gets a reply
+     * while we're still on the config AP network */
     httpd_resp_set_type(req, "application/json");
-    if (err == ESP_OK) {
-        httpd_resp_sendstr(req, "{\"ok\":true}");
-    } else {
-        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Connection failed to start\"}");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+
+    /* Schedule WiFi switch in a separate task to avoid blocking httpd
+     * and to let the response packet go out first */
+    typedef struct { char ssid[33]; char pass[65]; } wifi_switch_args_t;
+    wifi_switch_args_t *args = malloc(sizeof(wifi_switch_args_t));
+    if (args) {
+        memset(args, 0, sizeof(*args));
+        strncpy(args->ssid, ssid_buf, sizeof(args->ssid) - 1);
+        strncpy(args->pass, password, sizeof(args->pass) - 1);
+
+        void wifi_switch_task(void *a) {
+            wifi_switch_args_t *p = (wifi_switch_args_t *)a;
+            vTaskDelay(pdMS_TO_TICKS(300));  /* let HTTP response finish */
+            wifi_manager_connect_to(p->ssid, p->pass);
+            free(p);
+            vTaskDelete(NULL);
+        }
+        xTaskCreate(wifi_switch_task, "wifi_sw", 2048, args, 5, NULL);
     }
+
     return ESP_OK;
 }
 

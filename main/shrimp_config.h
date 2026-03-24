@@ -74,7 +74,7 @@
 #define SHRIMP_FEISHU_MAX_MSG_LEN          4096
 #define SHRIMP_FEISHU_POLL_STACK           (12 * 1024)
 #define SHRIMP_FEISHU_POLL_PRIO            5
-#define SHRIMP_FEISHU_POLL_CORE            0
+#define SHRIMP_FEISHU_POLL_CORE            1
 #define SHRIMP_FEISHU_WEBHOOK_PORT         18790
 #define SHRIMP_FEISHU_WEBHOOK_PATH         "/feishu/events"
 #define SHRIMP_FEISHU_WEBHOOK_MAX_BODY     (16 * 1024)

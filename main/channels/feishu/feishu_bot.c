@@ -2,6 +2,7 @@
 #include "shrimp_config.h"
 #include "bus/message_bus.h"
 #include "proxy/http_proxy.h"
+#include "wifi/wifi_manager.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -664,6 +665,13 @@ static void feishu_ws_task(void *arg)
 {
     (void)arg;
     while (1) {
+        /* Wait for WiFi before attempting WS connection to avoid
+         * pointless reconnection loops that starve IDLE and trigger WDT */
+        while (!wifi_manager_is_connected()) {
+            ESP_LOGW(TAG, "Waiting for WiFi before WS connect...");
+            vTaskDelay(pdMS_TO_TICKS(2000));
+        }
+
         if (feishu_pull_ws_config() != ESP_OK) {
             vTaskDelay(pdMS_TO_TICKS(5000));
             continue;
@@ -673,6 +681,7 @@ static void feishu_ws_task(void *arg)
             .uri = s_ws_url,
             .buffer_size = 2048,
             .task_stack = SHRIMP_FEISHU_POLL_STACK,
+            .task_prio = 4,  /* below default 5 to avoid starving IDLE */
             .reconnect_timeout_ms = s_ws_reconnect_interval_ms,
             .network_timeout_ms = 10000,
             .disable_auto_reconnect = false,
@@ -688,8 +697,16 @@ static void feishu_ws_task(void *arg)
         esp_websocket_client_start(s_ws_client);
 
         int64_t last_ping = 0;
+        int64_t disconnect_since_ms = 0;  /* 0 = currently connected or never connected */
         while (s_ws_client) {
+            /* If WiFi dropped, break out immediately to stop/destroy the client
+             * and wait for WiFi in the outer loop */
+            if (!wifi_manager_is_connected()) {
+                ESP_LOGW(TAG, "WiFi lost, stopping Feishu WS client");
+                break;
+            }
             if (s_ws_connected) {
+                disconnect_since_ms = 0;  /* reset disconnect timer */
                 int64_t now = esp_timer_get_time() / 1000;
                 if (now - last_ping >= s_ws_ping_interval_ms) {
                     ws_frame_t ping = {0};
@@ -703,18 +720,27 @@ static void feishu_ws_task(void *arg)
                     ws_send_frame(&ping, NULL, 0, 1000);
                     last_ping = now;
                 }
+            } else {
+                /* WS is disconnected — the client's built-in auto_reconnect will
+                 * handle transient drops. Only break if disconnected for too long
+                 * (60s), which means the WS endpoint is likely stale and we need
+                 * to re-pull config from Feishu. */
+                int64_t now = esp_timer_get_time() / 1000;
+                if (disconnect_since_ms == 0) {
+                    disconnect_since_ms = now;
+                } else if (now - disconnect_since_ms > 60000) {
+                    ESP_LOGW(TAG, "WS disconnected for >60s, re-pulling config");
+                    break;
+                }
             }
-            if (!esp_websocket_client_is_connected(s_ws_client) && !s_ws_connected) {
-                break;
-            }
-            vTaskDelay(pdMS_TO_TICKS(200));
+            vTaskDelay(pdMS_TO_TICKS(500));
         }
 
         esp_websocket_client_stop(s_ws_client);
         esp_websocket_client_destroy(s_ws_client);
         s_ws_client = NULL;
         s_ws_connected = false;
-        vTaskDelay(pdMS_TO_TICKS(3000));
+        vTaskDelay(pdMS_TO_TICKS(5000));  /* longer delay to avoid WDT starvation during rapid reconnects */
     }
 }
 

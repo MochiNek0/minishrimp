@@ -29,6 +29,10 @@ static const char *TAG = "feishu";
 #define FEISHU_REPLY_MSG_URL    FEISHU_API_BASE "/im/v1/messages/%s/reply"
 #define FEISHU_WS_CONFIG_URL    "https://open.feishu.cn/callback/ws/endpoint"
 #define FEISHU_IMAGE_URL        FEISHU_API_BASE "/im/v1/images/%s"
+#define FEISHU_MSG_RESOURCE_URL FEISHU_API_BASE "/im/v1/messages/%s/resources/%s?type=image"
+
+/* Max WS session lifetime before forced reconnection (2 hours in ms) */
+#define FEISHU_WS_MAX_SESSION_MS  (2 * 60 * 60 * 1000LL)
 
 /* Max raw image download size (200KB) and base64 output */
 #define FEISHU_IMAGE_MAX_SIZE   (200 * 1024)
@@ -435,13 +439,14 @@ static char *feishu_api_call(const char *url, const char *method, const char *po
  * The caller must free the returned string.
  * Returns NULL on failure.
  */
-static char *feishu_download_image_base64(const char *image_key)
+static char *feishu_download_image_base64(const char *message_id, const char *file_key)
 {
-    if (!image_key || image_key[0] == '\0') return NULL;
+    if (!file_key || file_key[0] == '\0') return NULL;
+    if (!message_id || message_id[0] == '\0') return NULL;
     if (feishu_get_tenant_token() != ESP_OK) return NULL;
 
-    char url[256];
-    snprintf(url, sizeof(url), FEISHU_IMAGE_URL, image_key);
+    char url[512];
+    snprintf(url, sizeof(url), FEISHU_MSG_RESOURCE_URL, message_id, file_key);
 
     /* Use the http_resp_t to accumulate binary image data */
     http_resp_t resp = { .buf = heap_caps_calloc(1, FEISHU_IMAGE_MAX_SIZE, MALLOC_CAP_SPIRAM), .len = 0, .cap = FEISHU_IMAGE_MAX_SIZE };
@@ -789,6 +794,7 @@ static void feishu_ws_task(void *arg)
 
         int64_t last_ping = 0;
         int64_t disconnect_since_ms = 0;  /* 0 = currently connected or never connected */
+        int64_t session_start_ms = esp_timer_get_time() / 1000;  /* track session lifetime */
         while (s_ws_client) {
             /* If WiFi dropped, break out immediately to stop/destroy the client
              * and wait for WiFi in the outer loop */
@@ -799,6 +805,19 @@ static void feishu_ws_task(void *arg)
             if (s_ws_connected) {
                 disconnect_since_ms = 0;  /* reset disconnect timer */
                 int64_t now = esp_timer_get_time() / 1000;
+
+                /* Force reconnection if session exceeded max lifetime.
+                 * This prevents "zombie" WS connections where TCP is alive
+                 * but the Feishu endpoint ticket has expired. */
+                if (now - session_start_ms > FEISHU_WS_MAX_SESSION_MS) {
+                    ESP_LOGW(TAG, "WS session exceeded max lifetime (%lldms), re-pulling config",
+                             (long long)(now - session_start_ms));
+                    break;
+                }
+
+                /* Proactively refresh tenant token to keep it valid */
+                feishu_get_tenant_token();
+
                 if (now - last_ping >= s_ws_ping_interval_ms) {
                     ws_frame_t ping = {0};
                     ping.seq_id = 0;
@@ -902,11 +921,11 @@ static void handle_message_event(cJSON *event)
     char *image_data_uri = NULL;
 
     if (is_image) {
-        /* Extract image_key and download + base64 encode */
+        /* Extract image_key (used as file_key) and download via resources API */
         cJSON *image_key_j = cJSON_GetObjectItem(content_obj, "image_key");
         if (image_key_j && cJSON_IsString(image_key_j)) {
-            ESP_LOGI(TAG, "Image message, image_key=%s", image_key_j->valuestring);
-            image_data_uri = feishu_download_image_base64(image_key_j->valuestring);
+            ESP_LOGI(TAG, "Image message, message_id=%s image_key=%s", message_id, image_key_j->valuestring);
+            image_data_uri = feishu_download_image_base64(message_id, image_key_j->valuestring);
             if (!image_data_uri) {
                 ESP_LOGW(TAG, "Failed to download/encode image");
             }

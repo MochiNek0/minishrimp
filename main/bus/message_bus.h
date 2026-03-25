@@ -16,6 +16,7 @@ typedef struct {
     char channel[16];       /* "telegram", "websocket", "cli" */
     char chat_id[96];       /* Telegram/Feishu chat_id, open_id, or WS client id */
     char *content;          /* Heap-allocated message text (caller must free) */
+    char *image_url;        /* Heap-allocated image URL or data URI (optional, caller must free) */
 } shrimp_msg_t;
 
 /**

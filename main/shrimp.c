@@ -170,6 +170,7 @@ static void outbound_dispatch_task(void *arg)
         }
 
         free(msg.content);
+        free(msg.image_url);
     }
 }
 

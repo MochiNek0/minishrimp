@@ -17,6 +17,8 @@
 #include "esp_event.h"
 #include "nvs.h"
 #include "cJSON.h"
+#include "esp_heap_caps.h"
+#include "mbedtls/base64.h"
 
 static const char *TAG = "feishu";
 
@@ -26,6 +28,10 @@ static const char *TAG = "feishu";
 #define FEISHU_SEND_MSG_URL     FEISHU_API_BASE "/im/v1/messages"
 #define FEISHU_REPLY_MSG_URL    FEISHU_API_BASE "/im/v1/messages/%s/reply"
 #define FEISHU_WS_CONFIG_URL    "https://open.feishu.cn/callback/ws/endpoint"
+#define FEISHU_IMAGE_URL        FEISHU_API_BASE "/im/v1/images/%s"
+
+/* Max raw image download size (200KB) and base64 output */
+#define FEISHU_IMAGE_MAX_SIZE   (200 * 1024)
 
 /* ── Credentials & token state ─────────────────────────────── */
 static char s_app_id[64] = SHRIMP_SECRET_FEISHU_APP_ID;
@@ -422,6 +428,91 @@ static char *feishu_api_call(const char *url, const char *method, const char *po
     return resp.buf;
 }
 
+/* ── Image download & base64 encode ────────────────────────── */
+
+/**
+ * Download an image from Feishu API and return a base64 data URI.
+ * The caller must free the returned string.
+ * Returns NULL on failure.
+ */
+static char *feishu_download_image_base64(const char *image_key)
+{
+    if (!image_key || image_key[0] == '\0') return NULL;
+    if (feishu_get_tenant_token() != ESP_OK) return NULL;
+
+    char url[256];
+    snprintf(url, sizeof(url), FEISHU_IMAGE_URL, image_key);
+
+    /* Use the http_resp_t to accumulate binary image data */
+    http_resp_t resp = { .buf = heap_caps_calloc(1, FEISHU_IMAGE_MAX_SIZE, MALLOC_CAP_SPIRAM), .len = 0, .cap = FEISHU_IMAGE_MAX_SIZE };
+    if (!resp.buf) {
+        ESP_LOGE(TAG, "Failed to alloc image buffer (%d bytes)", FEISHU_IMAGE_MAX_SIZE);
+        return NULL;
+    }
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .event_handler = http_event_handler,
+        .user_data = &resp,
+        .timeout_ms = 30000,
+        .buffer_size = 4096,
+        .buffer_size_tx = 1024,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) { free(resp.buf); return NULL; }
+
+    char auth_header[600];
+    snprintf(auth_header, sizeof(auth_header), "Bearer %s", s_tenant_token);
+    esp_http_client_set_header(client, "Authorization", auth_header);
+
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+
+    if (err != ESP_OK || status != 200 || resp.len == 0) {
+        ESP_LOGE(TAG, "Image download failed: err=%s status=%d len=%d",
+                 esp_err_to_name(err), status, (int)resp.len);
+        free(resp.buf);
+        return NULL;
+    }
+
+    ESP_LOGI(TAG, "Downloaded image: %d bytes", (int)resp.len);
+
+    /* Base64 encode */
+    size_t b64_len = 0;
+    mbedtls_base64_encode(NULL, 0, &b64_len, (const unsigned char *)resp.buf, resp.len);
+
+    /* Allocate: "data:image/png;base64," (22 chars) + b64_len + 1 */
+    size_t data_uri_len = 22 + b64_len + 1;
+    char *data_uri = heap_caps_malloc(data_uri_len, MALLOC_CAP_SPIRAM);
+    if (!data_uri) {
+        ESP_LOGE(TAG, "Failed to alloc base64 buffer (%d bytes)", (int)data_uri_len);
+        free(resp.buf);
+        return NULL;
+    }
+
+    memcpy(data_uri, "data:image/png;base64,", 22);
+    size_t written = 0;
+    int ret = mbedtls_base64_encode(
+        (unsigned char *)(data_uri + 22), b64_len, &written,
+        (const unsigned char *)resp.buf, resp.len);
+
+    /* Free raw image data immediately */
+    free(resp.buf);
+
+    if (ret != 0) {
+        ESP_LOGE(TAG, "Base64 encode failed: %d", ret);
+        free(data_uri);
+        return NULL;
+    }
+
+    data_uri[22 + written] = '\0';
+    ESP_LOGI(TAG, "Image base64 encoded: %d bytes -> %d chars", (int)resp.len, (int)written);
+    return data_uri;
+}
+
 /* ── WS long connection ────────────────────────────────────── */
 static bool parse_query_param(const char *url, const char *key, char *out, size_t out_size)
 {
@@ -792,38 +883,58 @@ static void handle_message_event(cJSON *event)
         return;
     }
 
-    /* Only handle text messages for now */
-    if (strcmp(msg_type, "text") != 0) {
-        ESP_LOGI(TAG, "Ignoring non-text message type: %s", msg_type);
+    /* Handle text and image messages */
+    bool is_text = (strcmp(msg_type, "text") == 0);
+    bool is_image = (strcmp(msg_type, "image") == 0);
+    if (!is_text && !is_image) {
+        ESP_LOGI(TAG, "Ignoring unsupported message type: %s", msg_type);
         return;
     }
 
-    /* Parse the content JSON to extract text */
+    /* Parse the content JSON */
     cJSON *content_obj = cJSON_Parse(content_j->valuestring);
     if (!content_obj) {
         ESP_LOGW(TAG, "Failed to parse message content JSON");
         return;
     }
 
-    cJSON *text_j = cJSON_GetObjectItem(content_obj, "text");
-    if (!text_j || !cJSON_IsString(text_j)) {
-        cJSON_Delete(content_obj);
-        return;
-    }
+    const char *cleaned = NULL;
+    char *image_data_uri = NULL;
 
-    const char *text = text_j->valuestring;
+    if (is_image) {
+        /* Extract image_key and download + base64 encode */
+        cJSON *image_key_j = cJSON_GetObjectItem(content_obj, "image_key");
+        if (image_key_j && cJSON_IsString(image_key_j)) {
+            ESP_LOGI(TAG, "Image message, image_key=%s", image_key_j->valuestring);
+            image_data_uri = feishu_download_image_base64(image_key_j->valuestring);
+            if (!image_data_uri) {
+                ESP_LOGW(TAG, "Failed to download/encode image");
+            }
+        }
+        cleaned = "[图片]";
+    } else {
+        /* Text message */
+        cJSON *text_j = cJSON_GetObjectItem(content_obj, "text");
+        if (!text_j || !cJSON_IsString(text_j)) {
+            cJSON_Delete(content_obj);
+            return;
+        }
 
-    /* Strip @bot mention prefix if present (Feishu adds @_user_1 for mentions) */
-    const char *cleaned = text;
-    if (strncmp(cleaned, "@_user_1 ", 9) == 0) {
-        cleaned += 9;
-    }
-    /* Skip leading whitespace */
-    while (*cleaned == ' ' || *cleaned == '\n') cleaned++;
+        const char *text = text_j->valuestring;
 
-    if (cleaned[0] == '\0') {
-        cJSON_Delete(content_obj);
-        return;
+        /* Strip @bot mention prefix if present (Feishu adds @_user_1 for mentions) */
+        const char *tmp = text;
+        if (strncmp(tmp, "@_user_1 ", 9) == 0) {
+            tmp += 9;
+        }
+        /* Skip leading whitespace */
+        while (*tmp == ' ' || *tmp == '\n') tmp++;
+
+        if (tmp[0] == '\0') {
+            cJSON_Delete(content_obj);
+            return;
+        }
+        cleaned = tmp;
     }
 
     /* Get sender info */
@@ -856,12 +967,16 @@ static void handle_message_event(cJSON *event)
     strncpy(msg.channel, SHRIMP_CHAN_FEISHU, sizeof(msg.channel) - 1);
     strncpy(msg.chat_id, route_id, sizeof(msg.chat_id) - 1);
     msg.content = strdup(cleaned);
+    msg.image_url = image_data_uri;  /* transfer ownership (may be NULL) */
 
     if (msg.content) {
         if (message_bus_push_inbound(&msg) != ESP_OK) {
             ESP_LOGW(TAG, "Inbound queue full, dropping feishu message");
             free(msg.content);
+            free(msg.image_url);
         }
+    } else {
+        free(msg.image_url);
     }
 
     cJSON_Delete(content_obj);

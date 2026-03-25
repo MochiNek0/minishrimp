@@ -203,6 +203,38 @@ static void agent_loop_task(void *arg)
         esp_err_t err = message_bus_pop_inbound(&msg, UINT32_MAX);
         if (err != ESP_OK) continue;
 
+        /* ── Debounce: wait for more messages from the same chat_id ── */
+#if SHRIMP_AGENT_DEBOUNCE_MS > 0
+        {
+            shrimp_msg_t extra;
+            while (message_bus_pop_inbound(&extra, SHRIMP_AGENT_DEBOUNCE_MS) == ESP_OK) {
+                if (strcmp(extra.chat_id, msg.chat_id) == 0) {
+                    /* Same user — append content with newline */
+                    size_t old_len = strlen(msg.content);
+                    size_t add_len = strlen(extra.content);
+                    char *merged = realloc(msg.content, old_len + 1 + add_len + 1);
+                    if (merged) {
+                        merged[old_len] = '\n';
+                        memcpy(merged + old_len + 1, extra.content, add_len + 1);
+                        msg.content = merged;
+                    }
+                    /* If extra also has an image and msg doesn't, take it */
+                    if (extra.image_url && !msg.image_url) {
+                        msg.image_url = extra.image_url;
+                        extra.image_url = NULL;
+                    }
+                    free(extra.content);
+                    free(extra.image_url);
+                    ESP_LOGI(TAG, "Debounce: merged message from %s:%s", extra.channel, extra.chat_id);
+                } else {
+                    /* Different user — push back and stop debouncing */
+                    message_bus_push_inbound(&extra);
+                    break;
+                }
+            }
+        }
+#endif
+
         ESP_LOGI(TAG, "Processing message from %s:%s", msg.channel, msg.chat_id);
 
         /* 1. Build system prompt */
@@ -217,10 +249,61 @@ static void agent_loop_task(void *arg)
         cJSON *messages = cJSON_Parse(history_json);
         if (!messages) messages = cJSON_CreateArray();
 
-        /* 3. Append current user message */
+        /* 3. Append current user message (with optional image) */
         cJSON *user_msg = cJSON_CreateObject();
         cJSON_AddStringToObject(user_msg, "role", "user");
-        cJSON_AddStringToObject(user_msg, "content", msg.content);
+
+        if (msg.image_url && msg.image_url[0]) {
+            /* Multimodal: build content array with image + text */
+            cJSON *content_arr = cJSON_CreateArray();
+
+            /* Image block */
+            cJSON *img_block = cJSON_CreateObject();
+            cJSON_AddStringToObject(img_block, "type", "image");
+            cJSON *source = cJSON_CreateObject();
+            if (strncmp(msg.image_url, "data:", 5) == 0) {
+                /* data URI: extract media type and base64 data */
+                cJSON_AddStringToObject(source, "type", "base64");
+                /* Parse: data:<media_type>;base64,<data> */
+                const char *semi = strchr(msg.image_url + 5, ';');
+                if (semi) {
+                    size_t mt_len = semi - (msg.image_url + 5);
+                    char *media_type = malloc(mt_len + 1);
+                    if (media_type) {
+                        memcpy(media_type, msg.image_url + 5, mt_len);
+                        media_type[mt_len] = '\0';
+                        cJSON_AddStringToObject(source, "media_type", media_type);
+                        free(media_type);
+                    }
+                    const char *comma = strchr(semi, ',');
+                    if (comma) {
+                        cJSON_AddStringToObject(source, "data", comma + 1);
+                    }
+                }
+            } else {
+                /* HTTP URL */
+                cJSON_AddStringToObject(source, "type", "url");
+                cJSON_AddStringToObject(source, "url", msg.image_url);
+            }
+            cJSON_AddItemToObject(img_block, "source", source);
+            cJSON_AddItemToArray(content_arr, img_block);
+
+            /* Text block */
+            cJSON *text_block = cJSON_CreateObject();
+            cJSON_AddStringToObject(text_block, "type", "text");
+            cJSON_AddStringToObject(text_block, "text", msg.content);
+            cJSON_AddItemToArray(content_arr, text_block);
+
+            cJSON_AddItemToObject(user_msg, "content", content_arr);
+
+            /* Free image_url now — it's been copied into the JSON */
+            free(msg.image_url);
+            msg.image_url = NULL;
+
+            ESP_LOGI(TAG, "Built multimodal user message with image");
+        } else {
+            cJSON_AddStringToObject(user_msg, "content", msg.content);
+        }
         cJSON_AddItemToArray(messages, user_msg);
 
         /* 4. ReAct loop */
@@ -346,6 +429,7 @@ static void agent_loop_task(void *arg)
 
         /* Free inbound message content */
         free(msg.content);
+        free(msg.image_url);
 
         /* Log memory status */
         ESP_LOGI(TAG, "Free PSRAM: %d bytes",

@@ -87,6 +87,7 @@
 #define SHRIMP_AGENT_MAX_TOOL_ITER     10
 #define SHRIMP_MAX_TOOL_CALLS          4
 #define SHRIMP_AGENT_SEND_WORKING_STATUS 1
+#define SHRIMP_AGENT_DEBOUNCE_MS       15000
 
 /* Timezone (POSIX TZ format) - China Standard Time (UTC+8) */
 #define SHRIMP_TIMEZONE                "CST-8"

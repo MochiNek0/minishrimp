@@ -618,56 +618,128 @@ static cJSON *convert_messages_openai(const char *system_prompt, cJSON *messages
             cJSON_AddItemToArray(out, m);
             free(text_buf);
         } else if (strcmp(role->valuestring, "user") == 0) {
-            /* tool_result blocks become role=tool */
+            /* Check if content array has image blocks */
             cJSON *block;
-            bool has_user_text = false;
-            char *text_buf = NULL;
-            size_t text_buf_cap = 0;
-            size_t off = 0;
+            bool has_image = false;
+            bool has_tool_result = false;
             cJSON_ArrayForEach(block, content) {
                 cJSON *btype = cJSON_GetObjectItem(block, "type");
-                if (btype && cJSON_IsString(btype) && strcmp(btype->valuestring, "tool_result") == 0) {
-                    cJSON *tool_id = cJSON_GetObjectItem(block, "tool_use_id");
-                    cJSON *tcontent = cJSON_GetObjectItem(block, "content");
-                    if (!tool_id || !cJSON_IsString(tool_id)) continue;
-                    cJSON *tm = cJSON_CreateObject();
-                    cJSON_AddStringToObject(tm, "role", "tool");
-                    cJSON_AddStringToObject(tm, "tool_call_id", tool_id->valuestring);
-                    if (tcontent && cJSON_IsString(tcontent)) {
-                        cJSON_AddStringToObject(tm, "content", tcontent->valuestring);
-                    } else {
-                        cJSON_AddStringToObject(tm, "content", "");
-                    }
-                    cJSON_AddItemToArray(out, tm);
-                } else if (btype && cJSON_IsString(btype) && strcmp(btype->valuestring, "text") == 0) {
-                    cJSON *text = cJSON_GetObjectItem(block, "text");
-                    if (text && cJSON_IsString(text)) {
-                        size_t tlen = strlen(text->valuestring);
-                        /* Allocate or expand buffer as needed */
-                        if (off + tlen + 1 > text_buf_cap) {
-                            size_t new_cap = (off + tlen + 1) * 2;
-                            char *tmp = realloc(text_buf, new_cap);
-                            if (!tmp) {
-                                ESP_LOGW(TAG, "Failed to expand user text buffer, truncating");
-                                continue;
-                            }
-                            text_buf = tmp;
-                            text_buf_cap = new_cap;
-                        }
-                        memcpy(text_buf + off, text->valuestring, tlen);
-                        off += tlen;
-                        text_buf[off] = '\0';
-                        has_user_text = true;
-                    }
+                if (btype && cJSON_IsString(btype)) {
+                    if (strcmp(btype->valuestring, "image") == 0) has_image = true;
+                    if (strcmp(btype->valuestring, "tool_result") == 0) has_tool_result = true;
                 }
             }
-            if (has_user_text && text_buf) {
+
+            if (has_image && !has_tool_result) {
+                /* Multimodal user message: convert to OpenAI format */
                 cJSON *um = cJSON_CreateObject();
                 cJSON_AddStringToObject(um, "role", "user");
-                cJSON_AddStringToObject(um, "content", text_buf);
+                cJSON *parts = cJSON_CreateArray();
+
+                cJSON_ArrayForEach(block, content) {
+                    cJSON *btype = cJSON_GetObjectItem(block, "type");
+                    if (!btype || !cJSON_IsString(btype)) continue;
+
+                    if (strcmp(btype->valuestring, "image") == 0) {
+                        /* Convert Anthropic image block to OpenAI image_url */
+                        cJSON *src = cJSON_GetObjectItem(block, "source");
+                        if (!src) continue;
+
+                        cJSON *src_type = cJSON_GetObjectItem(src, "type");
+                        const char *stype = (src_type && cJSON_IsString(src_type)) ? src_type->valuestring : "";
+
+                        char *img_url = NULL;
+                        if (strcmp(stype, "base64") == 0) {
+                            cJSON *mt = cJSON_GetObjectItem(src, "media_type");
+                            cJSON *data = cJSON_GetObjectItem(src, "data");
+                            if (mt && cJSON_IsString(mt) && data && cJSON_IsString(data)) {
+                                /* Reconstruct: data:<media_type>;base64,<data> */
+                                size_t url_len = 5 + strlen(mt->valuestring) + 8 + strlen(data->valuestring) + 1;
+                                img_url = malloc(url_len);
+                                if (img_url) {
+                                    snprintf(img_url, url_len, "data:%s;base64,%s",
+                                             mt->valuestring, data->valuestring);
+                                }
+                            }
+                        } else if (strcmp(stype, "url") == 0) {
+                            cJSON *url = cJSON_GetObjectItem(src, "url");
+                            if (url && cJSON_IsString(url)) {
+                                img_url = strdup(url->valuestring);
+                            }
+                        }
+
+                        if (img_url) {
+                            cJSON *part = cJSON_CreateObject();
+                            cJSON_AddStringToObject(part, "type", "image_url");
+                            cJSON *iu = cJSON_CreateObject();
+                            cJSON_AddStringToObject(iu, "url", img_url);
+                            cJSON_AddItemToObject(part, "image_url", iu);
+                            cJSON_AddItemToArray(parts, part);
+                            free(img_url);
+                        }
+                    } else if (strcmp(btype->valuestring, "text") == 0) {
+                        cJSON *text = cJSON_GetObjectItem(block, "text");
+                        if (text && cJSON_IsString(text)) {
+                            cJSON *part = cJSON_CreateObject();
+                            cJSON_AddStringToObject(part, "type", "text");
+                            cJSON_AddStringToObject(part, "text", text->valuestring);
+                            cJSON_AddItemToArray(parts, part);
+                        }
+                    }
+                }
+
+                cJSON_AddItemToObject(um, "content", parts);
                 cJSON_AddItemToArray(out, um);
+            } else {
+                /* tool_result blocks become role=tool, text blocks become user text */
+                bool has_user_text = false;
+                char *text_buf = NULL;
+                size_t text_buf_cap = 0;
+                size_t off = 0;
+                cJSON_ArrayForEach(block, content) {
+                    cJSON *btype = cJSON_GetObjectItem(block, "type");
+                    if (btype && cJSON_IsString(btype) && strcmp(btype->valuestring, "tool_result") == 0) {
+                        cJSON *tool_id = cJSON_GetObjectItem(block, "tool_use_id");
+                        cJSON *tcontent = cJSON_GetObjectItem(block, "content");
+                        if (!tool_id || !cJSON_IsString(tool_id)) continue;
+                        cJSON *tm = cJSON_CreateObject();
+                        cJSON_AddStringToObject(tm, "role", "tool");
+                        cJSON_AddStringToObject(tm, "tool_call_id", tool_id->valuestring);
+                        if (tcontent && cJSON_IsString(tcontent)) {
+                            cJSON_AddStringToObject(tm, "content", tcontent->valuestring);
+                        } else {
+                            cJSON_AddStringToObject(tm, "content", "");
+                        }
+                        cJSON_AddItemToArray(out, tm);
+                    } else if (btype && cJSON_IsString(btype) && strcmp(btype->valuestring, "text") == 0) {
+                        cJSON *text = cJSON_GetObjectItem(block, "text");
+                        if (text && cJSON_IsString(text)) {
+                            size_t tlen = strlen(text->valuestring);
+                            if (off + tlen + 1 > text_buf_cap) {
+                                size_t new_cap = (off + tlen + 1) * 2;
+                                char *tmp = realloc(text_buf, new_cap);
+                                if (!tmp) {
+                                    ESP_LOGW(TAG, "Failed to expand user text buffer, truncating");
+                                    continue;
+                                }
+                                text_buf = tmp;
+                                text_buf_cap = new_cap;
+                            }
+                            memcpy(text_buf + off, text->valuestring, tlen);
+                            off += tlen;
+                            text_buf[off] = '\0';
+                            has_user_text = true;
+                        }
+                    }
+                }
+                if (has_user_text && text_buf) {
+                    cJSON *um = cJSON_CreateObject();
+                    cJSON_AddStringToObject(um, "role", "user");
+                    cJSON_AddStringToObject(um, "content", text_buf);
+                    cJSON_AddItemToArray(out, um);
+                }
+                free(text_buf);
             }
-            free(text_buf);
         }
     }
 

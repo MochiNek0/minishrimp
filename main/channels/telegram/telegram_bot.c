@@ -282,6 +282,41 @@ static bool tg_response_is_ok(const char *resp, const char **out_desc)
     return false;
 }
 
+/* Get file_path from Telegram getFile API and construct download URL */
+static char *tg_get_file_url(const char *file_id)
+{
+    char params[256];
+    snprintf(params, sizeof(params), "getFile?file_id=%s", file_id);
+
+    char *resp = tg_api_call(params, NULL);
+    if (!resp) return NULL;
+
+    char *file_url = NULL;
+    cJSON *root = cJSON_Parse(resp);
+    if (root) {
+        cJSON *ok = cJSON_GetObjectItem(root, "ok");
+        if (cJSON_IsTrue(ok)) {
+            cJSON *result = cJSON_GetObjectItem(root, "result");
+            if (result) {
+                cJSON *file_path = cJSON_GetObjectItem(result, "file_path");
+                if (file_path && cJSON_IsString(file_path)) {
+                    /* Construct: https://api.telegram.org/file/bot<token>/<file_path> */
+                    size_t url_len = 40 + strlen(s_bot_token) + strlen(file_path->valuestring) + 1;
+                    file_url = malloc(url_len);
+                    if (file_url) {
+                        snprintf(file_url, url_len,
+                                 "https://api.telegram.org/file/bot%s/%s",
+                                 s_bot_token, file_path->valuestring);
+                    }
+                }
+            }
+        }
+        cJSON_Delete(root);
+    }
+    free(resp);
+    return file_url;
+}
+
 static void process_updates(const char *json_str)
 {
     cJSON *root = cJSON_Parse(json_str);
@@ -319,14 +354,21 @@ static void process_updates(const char *json_str)
         cJSON *message = cJSON_GetObjectItem(update, "message");
         if (!message) continue;
 
-        cJSON *text = cJSON_GetObjectItem(message, "text");
-        if (!text || !cJSON_IsString(text)) continue;
-
         cJSON *chat = cJSON_GetObjectItem(message, "chat");
         if (!chat) continue;
 
         cJSON *chat_id = cJSON_GetObjectItem(chat, "id");
         if (!chat_id) continue;
+
+        /* Determine if this is a text or photo message */
+        cJSON *text = cJSON_GetObjectItem(message, "text");
+        cJSON *photo = cJSON_GetObjectItem(message, "photo");
+        cJSON *caption = cJSON_GetObjectItem(message, "caption");
+
+        /* Must have either text or photo */
+        bool has_text = (text && cJSON_IsString(text));
+        bool has_photo = (photo && cJSON_IsArray(photo) && cJSON_GetArraySize(photo) > 0);
+        if (!has_text && !has_photo) continue;
 
         int msg_id_val = -1;
         cJSON *message_id = cJSON_GetObjectItem(message, "message_id");
@@ -354,19 +396,52 @@ static void process_updates(const char *json_str)
             seen_msg_insert(msg_key);
         }
 
-        ESP_LOGI(TAG, "Message update_id=%" PRId64 " message_id=%d from chat %s: %.40s...",
-                 uid, msg_id_val, chat_id_str, text->valuestring);
-
-        /* Push to inbound bus */
+        /* Build bus message */
         shrimp_msg_t msg = {0};
         strncpy(msg.channel, SHRIMP_CHAN_TELEGRAM, sizeof(msg.channel) - 1);
         strncpy(msg.chat_id, chat_id_str, sizeof(msg.chat_id) - 1);
-        msg.content = strdup(text->valuestring);
+
+        if (has_photo) {
+            /* Pick the largest photo (last element in the array) */
+            int photo_count = cJSON_GetArraySize(photo);
+            cJSON *best = cJSON_GetArrayItem(photo, photo_count - 1);
+            if (best) {
+                cJSON *file_id = cJSON_GetObjectItem(best, "file_id");
+                if (file_id && cJSON_IsString(file_id)) {
+                    msg.image_url = tg_get_file_url(file_id->valuestring);
+                    if (msg.image_url) {
+                        ESP_LOGI(TAG, "Photo message from chat %s, file URL obtained", chat_id_str);
+                    } else {
+                        ESP_LOGW(TAG, "Failed to get file URL for photo from chat %s", chat_id_str);
+                    }
+                }
+            }
+            /* Use caption as content, or default text */
+            if (caption && cJSON_IsString(caption)) {
+                msg.content = strdup(caption->valuestring);
+            } else {
+                msg.content = strdup("[图片]");
+            }
+        } else {
+            msg.content = strdup(text->valuestring);
+        }
+
+        if (has_text) {
+            ESP_LOGI(TAG, "Message update_id=%" PRId64 " message_id=%d from chat %s: %.40s...",
+                     uid, msg_id_val, chat_id_str, text->valuestring);
+        } else {
+            ESP_LOGI(TAG, "Photo update_id=%" PRId64 " message_id=%d from chat %s",
+                     uid, msg_id_val, chat_id_str);
+        }
+
         if (msg.content) {
             if (message_bus_push_inbound(&msg) != ESP_OK) {
                 ESP_LOGW(TAG, "Inbound queue full, drop telegram message");
                 free(msg.content);
+                free(msg.image_url);
             }
+        } else {
+            free(msg.image_url);
         }
     }
 

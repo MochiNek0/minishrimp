@@ -9,6 +9,7 @@
 #include "esp_spiffs.h"
 #include "nvs_flash.h"
 #include "esp_sntp.h"
+#include "cJSON.h"
 
 #include "shrimp_config.h"
 #include "bus/message_bus.h"
@@ -27,6 +28,17 @@
 #include "skills/skill_loader.h"
 
 static const char *TAG = "shrimp";
+
+static void *cjson_psram_malloc(size_t size)
+{
+    return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+}
+
+static void cjson_psram_free(void *ptr)
+{
+    heap_caps_free(ptr);
+}
+
 
 static void time_sync_notification_cb(struct timeval *tv)
 {
@@ -178,6 +190,14 @@ void app_main(void)
 {
     /* Silence noisy components */
     esp_log_level_set("esp-x509-crt-bundle", ESP_LOG_WARN);
+
+    /* Initialize cJSON hooks to use PSRAM */
+    cJSON_Hooks hooks = {
+        .malloc_fn = cjson_psram_malloc,
+        .free_fn = cjson_psram_free
+    };
+    cJSON_InitHooks(&hooks);
+
 
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "  MiniShrimp - ESP32-S3 AI Agent");

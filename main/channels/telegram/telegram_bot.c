@@ -12,6 +12,9 @@
 #include "esp_crt_bundle.h"
 #include "nvs.h"
 #include "cJSON.h"
+#include "mbedtls/base64.h"
+#include "esp_heap_caps.h"
+
 
 static const char *TAG = "telegram";
 
@@ -25,6 +28,8 @@ static int64_t s_last_offset_save_us = 0;
 #define TG_DEDUP_CACHE_SIZE          64
 #define TG_OFFSET_SAVE_INTERVAL_US   (5LL * 1000 * 1000)
 #define TG_OFFSET_SAVE_STEP          10
+#define TG_IMAGE_MAX_SIZE          (200 * 1024)
+
 
 static uint64_t s_seen_msg_keys[TG_DEDUP_CACHE_SIZE] = {0};
 static size_t s_seen_msg_idx = 0;
@@ -35,6 +40,10 @@ typedef struct {
     size_t len;
     size_t cap;
 } http_resp_t;
+
+static char *tg_get_file_url(const char *file_id);
+static char *tg_api_call(const char *method, const char *post_data);
+static char *telegram_download_image_base64(const char *file_id);
 
 static uint64_t fnv1a64(const char *s)
 {
@@ -251,6 +260,143 @@ static char *tg_api_call(const char *method, const char *post_data)
     return tg_api_call_direct(method, post_data);
 }
 
+static bool parse_url_parts(const char *url, char *host, size_t host_size, char *path, size_t path_size, int *port)
+{
+    if (!url || !host || !path || host_size == 0 || path_size == 0) return false;
+
+    const char *scheme = strstr(url, "://");
+    const char *p = scheme ? (scheme + 3) : url;
+    const char *slash = strchr(p, '/');
+    size_t host_len = slash ? (size_t)(slash - p) : strlen(p);
+    if (host_len == 0 || host_len >= host_size) return false;
+    memcpy(host, p, host_len);
+    host[host_len] = '\0';
+
+    if (slash) {
+        size_t path_len = strlen(slash);
+        if (path_len >= path_size) return false;
+        memcpy(path, slash, path_len);
+        path[path_len] = '\0';
+    } else {
+        if (path_size < 2) return false;
+        path[0] = '/';
+        path[1] = '\0';
+    }
+
+    int pnum = 443;
+    char *colon = strchr(host, ':');
+    if (colon) {
+        *colon = '\0';
+        pnum = atoi(colon + 1);
+        if (pnum <= 0) pnum = 443;
+    }
+    if (port) *port = pnum;
+    return true;
+}
+
+static char *telegram_download_image_base64(const char *file_id)
+{
+    if (!file_id || file_id[0] == '\0') return NULL;
+
+    char *url = tg_get_file_url(file_id);
+    if (!url) return NULL;
+
+    http_resp_t resp = { .buf = heap_caps_calloc(1, TG_IMAGE_MAX_SIZE, MALLOC_CAP_SPIRAM), .len = 0, .cap = TG_IMAGE_MAX_SIZE };
+    if (!resp.buf) {
+        ESP_LOGE(TAG, "Failed to alloc image buffer (%d bytes)", TG_IMAGE_MAX_SIZE);
+        free(url);
+        return NULL;
+    }
+
+    esp_err_t err = ESP_FAIL;
+    int status = 0;
+
+    if (http_proxy_is_enabled()) {
+        char host[128];
+        char path[192];
+        int port = 443;
+        if (parse_url_parts(url, host, sizeof(host), path, sizeof(path), &port)) {
+            proxy_conn_t *conn = proxy_conn_open(host, port, 30000);
+            if (conn) {
+                char header[512];
+                int hlen = snprintf(header, sizeof(header),
+                    "GET %s HTTP/1.1\r\n"
+                    "Host: %s\r\n"
+                    "Connection: close\r\n\r\n",
+                    path, host);
+                if (proxy_conn_write(conn, header, hlen) >= 0) {
+                    char tmp[4096];
+                    while (1) {
+                        int n = proxy_conn_read(conn, tmp, sizeof(tmp), 30000);
+                        if (n <= 0) break;
+                        if (resp.len + n >= resp.cap) break;
+                        memcpy(resp.buf + resp.len, tmp, n);
+                        resp.len += n;
+                    }
+                    /* Skip headers manually for proxy connection */
+                    char *body = NULL;
+                    for (size_t i = 0; i < resp.len - 3; i++) {
+                        if (resp.buf[i] == '\r' && resp.buf[i+1] == '\n' &&
+                            resp.buf[i+2] == '\r' && resp.buf[i+3] == '\n') {
+                            body = resp.buf + i + 4;
+                            break;
+                        }
+                    }
+                    if (body) {
+                        size_t body_len = resp.len - (body - resp.buf);
+                        memmove(resp.buf, body, body_len);
+                        resp.len = body_len;
+                        status = 200;
+                        err = ESP_OK;
+                    }
+                }
+                proxy_conn_close(conn);
+            }
+        }
+    } else {
+        esp_http_client_config_t config = {
+            .url = url,
+            .event_handler = http_event_handler,
+            .user_data = &resp,
+            .timeout_ms = 30000,
+            .buffer_size = 4096,
+            .buffer_size_tx = 1024,
+            .crt_bundle_attach = esp_crt_bundle_attach,
+        };
+        esp_http_client_handle_t client = esp_http_client_init(&config);
+        if (client) {
+            err = esp_http_client_perform(client);
+            status = esp_http_client_get_status_code(client);
+            esp_http_client_cleanup(client);
+        }
+    }
+
+    free(url);
+
+    if (err != ESP_OK || status != 200 || resp.len == 0) {
+        ESP_LOGE(TAG, "Image download failed or empty: err=%s status=%d len=%d",
+                 esp_err_to_name(err), status, (int)resp.len);
+        free(resp.buf);
+        return NULL;
+    }
+
+    /* Base64 encode */
+    size_t b64_len = 0;
+    mbedtls_base64_encode(NULL, 0, &b64_len, (const unsigned char *)resp.buf, resp.len);
+    size_t data_uri_len = 22 + b64_len + 1;
+    char *data_uri = heap_caps_malloc(data_uri_len, MALLOC_CAP_SPIRAM);
+    if (data_uri) {
+        memcpy(data_uri, "data:image/png;base64,", 22);
+        size_t written = 0;
+        mbedtls_base64_encode((unsigned char *)(data_uri + 22), b64_len, &written,
+                               (const unsigned char *)resp.buf, resp.len);
+        data_uri[22 + written] = '\0';
+    }
+    free(resp.buf);
+    return data_uri;
+}
+
+
 static bool tg_response_is_ok(const char *resp, const char **out_desc)
 {
     if (out_desc) {
@@ -408,11 +554,11 @@ static void process_updates(const char *json_str)
             if (best) {
                 cJSON *file_id = cJSON_GetObjectItem(best, "file_id");
                 if (file_id && cJSON_IsString(file_id)) {
-                    msg.image_url = tg_get_file_url(file_id->valuestring);
+                    msg.image_url = telegram_download_image_base64(file_id->valuestring);
                     if (msg.image_url) {
-                        ESP_LOGI(TAG, "Photo message from chat %s, file URL obtained", chat_id_str);
+                        ESP_LOGI(TAG, "Photo message from chat %s, Base64 URI obtained", chat_id_str);
                     } else {
-                        ESP_LOGW(TAG, "Failed to get file URL for photo from chat %s", chat_id_str);
+                        ESP_LOGW(TAG, "Failed to download photo from chat %s", chat_id_str);
                     }
                 }
             }

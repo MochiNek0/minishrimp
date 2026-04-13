@@ -242,25 +242,6 @@ esp_err_t session_get_history_json(const char *chat_id, char *buf, size_t size, 
     }
     fclose(f);
 
-    /* Check conversation freshness - if first msg is old, note it */
-    char freshness_note[256] = "";
-    if (count > 0) {
-        int start = (count < max_msgs) ? 0 : write_idx;
-        cJSON *first_obj = messages[start];
-        cJSON *first_ts = cJSON_GetObjectItem(first_obj, "ts");
-        if (first_ts && cJSON_IsNumber(first_ts)) {
-            time_t first_time = (time_t)first_ts->valuedouble;
-            double diff_hours = difftime(now_ts, first_time) / 3600.0;
-
-            if (diff_hours > 12) {
-                snprintf(freshness_note, sizeof(freshness_note),
-                    "\n[Note: This conversation started %.0f hours ago. "
-                    "If the user starts a new topic, treat it as a fresh conversation.]",
-                    diff_hours);
-            }
-        }
-    }
-
     /* Build JSON array with role, content, and time hint */
     cJSON *arr = cJSON_CreateArray();
     int start = (count < max_msgs) ? 0 : write_idx;
@@ -308,14 +289,8 @@ esp_err_t session_get_history_json(const char *chat_id, char *buf, size_t size, 
     cJSON_Delete(arr);
 
     if (json_str) {
-        if (freshness_note[0]) {
-            /* Prepend freshness note as a system hint */
-            snprintf(buf, size, "[{\"role\":\"system\",\"content\":\"%s\"},%s",
-                freshness_note + 1, json_str + 1);  /* Skip leading '[' */
-        } else {
-            strncpy(buf, json_str, size - 1);
-            buf[size - 1] = '\0';
-        }
+        strncpy(buf, json_str, size - 1);
+        buf[size - 1] = '\0';
         free(json_str);
     } else {
         snprintf(buf, size, "[]");

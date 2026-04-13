@@ -4,6 +4,7 @@
 #include "bus/message_bus.h"
 #include "llm/llm_proxy.h"
 #include "memory/session_mgr.h"
+#include "agent/subject_router.h"
 #include "tools/tool_registry.h"
 #include "utils/string_utils.h"
 
@@ -64,7 +65,7 @@ static void json_set_string(cJSON *obj, const char *key, const char *value)
     cJSON_AddStringToObject(obj, key, value);
 }
 
-static void append_turn_context_prompt(char *prompt, size_t size, const shrimp_msg_t *msg)
+static void append_turn_context_prompt(char *prompt, size_t size, const shrimp_msg_t *msg, const char *topic_id)
 {
     if (!prompt || size == 0 || !msg) {
         return;
@@ -80,10 +81,11 @@ static void append_turn_context_prompt(char *prompt, size_t size, const shrimp_m
         "\n## Current Turn Context\n"
         "- source_channel: %s\n"
         "- source_chat_id: %s\n"
-        "- If using cron_add in this turn, set channel to source_channel and chat_id to source_chat_id.\n"
-        "- Never use chat_id 'cron' for Feishu or Telegram messages.\n",
+        "- active_topic_id: %s\n"
+        "- If using cron_add in this turn, set channel to source_channel and chat_id to source_chat_id.\n",
         msg->channel[0] ? msg->channel : "(unknown)",
-        msg->chat_id[0] ? msg->chat_id : "(empty)");
+        msg->chat_id[0] ? msg->chat_id : "(empty)",
+        topic_id ? topic_id : "(none)");
 
     if (n < 0 || (size_t)n >= (size - off)) {
         prompt[size - 1] = '\0';
@@ -237,13 +239,27 @@ static void agent_loop_task(void *arg)
 
         ESP_LOGI(TAG, "Processing message from %s:%s", msg.channel, msg.chat_id);
 
-        /* 1. Build system prompt */
+        /* 1. Build base system prompt */
         context_build_system_prompt(system_prompt, SHRIMP_CONTEXT_BUF_SIZE);
-        append_turn_context_prompt(system_prompt, SHRIMP_CONTEXT_BUF_SIZE, &msg);
-        ESP_LOGI(TAG, "LLM turn context: channel=%s chat_id=%s", msg.channel, msg.chat_id);
 
-        /* 2. Load session history into cJSON array */
-        session_get_history_json(msg.chat_id, history_json,
+        /* 2. Semantic Routing */
+        float msg_vec[SUBJECT_VEC_DIM];
+        char topic_id[64];
+        if (subject_router_classify(msg.content, msg_vec) == ESP_OK) {
+            subject_router_find_target(msg.chat_id, msg_vec, topic_id, sizeof(topic_id));
+        } else {
+            /* Fallback to simple chat_id if classification fails */
+            strncpy(topic_id, msg.chat_id, sizeof(topic_id) - 1);
+            topic_id[sizeof(topic_id) - 1] = '\0';
+            ESP_LOGW(TAG, "Classification failed, fallback to chat_id session");
+        }
+
+        /* 3. Build turn-specific context and inject topic info */
+        append_turn_context_prompt(system_prompt, SHRIMP_CONTEXT_BUF_SIZE, &msg, topic_id);
+        ESP_LOGI(TAG, "LLM turn context: topic=%s", topic_id);
+
+        /* 4. Load session history into cJSON array */
+        session_get_history_json(topic_id, history_json,
                                  SHRIMP_LLM_STREAM_BUF_SIZE, SHRIMP_AGENT_MAX_HISTORY);
 
         cJSON *messages = cJSON_Parse(history_json);
@@ -383,15 +399,16 @@ static void agent_loop_task(void *arg)
         /* 5. Send response */
         if (final_text && final_text[0]) {
             /* Save to session (only user text + final assistant text) */
-            esp_err_t save_user = session_append(msg.chat_id, "user", msg.content);
-            esp_err_t save_asst = session_append(msg.chat_id, "assistant", final_text);
+            esp_err_t save_user = session_append(topic_id, "user", msg.content);
+            esp_err_t save_asst = session_append(topic_id, "assistant", final_text);
+            
+            /* Update topic vector */
+            subject_router_update_session(topic_id, msg_vec);
+
             if (save_user != ESP_OK || save_asst != ESP_OK) {
-                ESP_LOGW(TAG, "Session save failed for chat %s (user=%s, assistant=%s)",
-                         msg.chat_id,
-                         esp_err_to_name(save_user),
-                         esp_err_to_name(save_asst));
+                ESP_LOGW(TAG, "Session save failed for topic %s", topic_id);
             } else {
-                ESP_LOGI(TAG, "Session saved for chat %s", msg.chat_id);
+                ESP_LOGI(TAG, "Session saved for topic %s", topic_id);
             }
 
             /* Push response to outbound */
@@ -439,6 +456,7 @@ static void agent_loop_task(void *arg)
 
 esp_err_t agent_loop_init(void)
 {
+    subject_router_init();
     ESP_LOGI(TAG, "Agent loop initialized");
     return ESP_OK;
 }

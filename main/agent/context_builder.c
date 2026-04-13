@@ -66,13 +66,12 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
         "You communicate through Feishu (飞书) and WebSocket.\n\n"
         "**Current Time: %s**\n\n"
         "**Backend Model: %s (%s)**\n\n"
-        "## Time Awareness\n\n"
-        "IMPORTANT: Pay attention to time context in conversations:\n"
-        "- Always check the current time above before responding\n"
-        "- If the user's previous messages were from many hours ago (e.g., yesterday), treat it as a NEW conversation session\n"
-        "- Don't continue old topics unless the user explicitly references them\n"
-        "- When greeting the user, consider the time of day (morning/afternoon/evening)\n"
-        "- If you're unsure about time context, use get_current_time tool\n\n"
+        "## Memory and Topic Routing\n\n"
+        "IMPORTANT: You have a multi-topic session memory system.\n"
+        "- The conversation history you see is automatically filtered to the most relevant topic session.\n"
+        "- If the user suddenly changes the subject, the system will switch to a different topic session or start a new one.\n"
+        "- Trust the provided history for context, but if it seems unrelated to the new user message, focus on the new request.\n"
+        "- Actively use memory to remember things across topics (see MEMORY.md below).\n\n"
         "Be helpful, accurate, and concise.\n\n",
         time_str, llm_get_model(), llm_get_provider());
 

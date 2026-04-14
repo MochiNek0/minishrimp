@@ -8,8 +8,12 @@
 #include <time.h>
 #include "esp_log.h"
 #include "cJSON.h"
+#include <unistd.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 static const char *TAG = "session";
+static SemaphoreHandle_t s_session_lock = NULL;
 
 /* FNV-1a 64-bit hash for compact, collision-resistant filenames */
 static uint64_t fnv1a_64(const char *s)
@@ -36,6 +40,9 @@ static void session_path(const char *chat_id, char *buf, size_t size)
 
 esp_err_t session_mgr_init(void)
 {
+    if (s_session_lock == NULL) {
+        s_session_lock = xSemaphoreCreateRecursiveMutex();
+    }
     ESP_LOGI(TAG, "Session manager initialized at %s", SHRIMP_SPIFFS_SESSION_DIR);
     return ESP_OK;
 }
@@ -50,76 +57,43 @@ static void trim_session_file(const char *path)
     FILE *f = fopen(path, "r");
     if (!f) return;
 
-    /* Count total lines first */
     int total_lines = 0;
     char line[2048];
     while (fgets(line, sizeof(line), f)) {
         total_lines++;
     }
+    fclose(f);
 
-    /* If small enough, no need to trim */
     if (total_lines <= SHRIMP_SESSION_MAX_MSGS) {
-        fclose(f);
         return;
     }
 
-    /* Seek back to beginning */
-    fseek(f, 0, SEEK_SET);
-
-    /* Read all lines into memory (using ring buffer approach) */
-    char **lines = calloc(SHRIMP_SESSION_MAX_MSGS, sizeof(char *));
-    if (!lines) {
-        fclose(f);
-        ESP_LOGW(TAG, "Cannot allocate memory for trimming");
+    int skip_lines = total_lines - SHRIMP_SESSION_MAX_MSGS;
+    const char *tmp_path = "/spiffs/trim.tmp";
+    
+    FILE *src = fopen(path, "r");
+    FILE *dst = fopen(tmp_path, "w");
+    if (!src || !dst) {
+        if (src) fclose(src);
+        if (dst) fclose(dst);
         return;
     }
 
-    int write_idx = 0;
-    int count = 0;
-
-    while (fgets(line, sizeof(line), f)) {
-        /* Strip newline for storage */
-        size_t len = strlen(line);
-        if (len > 0 && line[len - 1] == '\n') {
-            line[len - 1] = '\0';
-            len--;
+    int current_line = 0;
+    while (fgets(line, sizeof(line), src)) {
+        if (current_line >= skip_lines) {
+            fputs(line, dst);
         }
-
-        /* Free old line if overwriting */
-        if (count >= SHRIMP_SESSION_MAX_MSGS) {
-            free(lines[write_idx]);
-        }
-
-        /* Store the line */
-        lines[write_idx] = strdup(line);
-        write_idx = (write_idx + 1) % SHRIMP_SESSION_MAX_MSGS;
-        if (count < SHRIMP_SESSION_MAX_MSGS) count++;
-    }
-    fclose(f);
-
-    /* Rewrite the file with only the recent messages */
-    f = fopen(path, "w");
-    if (!f) {
-        ESP_LOGE(TAG, "Cannot rewrite session file %s", path);
-        for (int i = 0; i < count; i++) {
-            free(lines[i]);
-        }
-        free(lines);
-        return;
+        current_line++;
     }
 
-    int start = (count < SHRIMP_SESSION_MAX_MSGS) ? 0 : write_idx;
-    for (int i = 0; i < count; i++) {
-        int idx = (start + i) % SHRIMP_SESSION_MAX_MSGS;
-        if (lines[idx]) {
-            fprintf(f, "%s\n", lines[idx]);
-            free(lines[idx]);
-        }
-    }
-    free(lines);
-    fclose(f);
+    fclose(src);
+    fclose(dst);
 
-    ESP_LOGI(TAG, "Trimmed session file from %d to %d lines", total_lines, count);
+    unlink(path);
+    rename(tmp_path, path);
+
+    ESP_LOGI(TAG, "Streaming trim: %d -> %d lines", total_lines, SHRIMP_SESSION_MAX_MSGS);
 }
 
 /*
@@ -130,19 +104,35 @@ static void check_and_trim_session(const char *path)
     FILE *f = fopen(path, "r");
     if (!f) return;
 
+    /* Check number of lines first for hysteresis trimming */
+    int total_lines = 0;
+    char line[2048];
+    while (fgets(line, sizeof(line), f)) {
+        total_lines++;
+    }
+
     /* Get file size */
-    fseek(f, 0, SEEK_END);
     long size = ftell(f);
     fclose(f);
 
-    if (size > SHRIMP_SESSION_MAX_FILE_SIZE) {
-        ESP_LOGW(TAG, "Session file too large (%ld bytes), trimming", size);
+    /* 
+     * Hysteresis Trimming: 
+     * Only trim if count exceeds MAX_MSGS + MARGIN or File size exceeds LIMIT.
+     * This significantly reduces Flash writes for active conversations.
+     */
+    if (total_lines > (SHRIMP_SESSION_MAX_MSGS + SHRIMP_SESSION_TRIM_MARGIN) || 
+        size > SHRIMP_SESSION_MAX_FILE_SIZE) {
+        
+        ESP_LOGI(TAG, "Trimming triggered: %d lines, %ld bytes", total_lines, size);
         trim_session_file(path);
     }
 }
 
 esp_err_t session_append(const char *chat_id, const char *role, const char *content)
 {
+    if (!s_session_lock) return ESP_FAIL;
+    xSemaphoreTake(s_session_lock, portMAX_DELAY);
+
     char path[128];
     session_path(chat_id, path, sizeof(path));
 
@@ -152,6 +142,7 @@ esp_err_t session_append(const char *chat_id, const char *role, const char *cont
     FILE *f = fopen(path, "a");
     if (!f) {
         ESP_LOGE(TAG, "Cannot open session file %s", path);
+        xSemaphoreGive(s_session_lock);
         return ESP_FAIL;
     }
 
@@ -169,6 +160,7 @@ esp_err_t session_append(const char *chat_id, const char *role, const char *cont
     }
 
     fclose(f);
+    xSemaphoreGive(s_session_lock);
     return ESP_OK;
 }
 
@@ -204,6 +196,9 @@ static void format_relative_time(time_t msg_ts, time_t now_ts, char *buf, size_t
 
 esp_err_t session_get_history_json(const char *chat_id, char *buf, size_t size, int max_msgs)
 {
+    if (!s_session_lock) return ESP_FAIL;
+    xSemaphoreTake(s_session_lock, portMAX_DELAY);
+
     char path[128];
     session_path(chat_id, path, sizeof(path));
 
@@ -211,6 +206,7 @@ esp_err_t session_get_history_json(const char *chat_id, char *buf, size_t size, 
     if (!f) {
         /* No history yet */
         snprintf(buf, size, "[]");
+        xSemaphoreGive(s_session_lock);
         return ESP_OK;
     }
 
@@ -296,18 +292,24 @@ esp_err_t session_get_history_json(const char *chat_id, char *buf, size_t size, 
         snprintf(buf, size, "[]");
     }
 
+    xSemaphoreGive(s_session_lock);
     return ESP_OK;
 }
 
 esp_err_t session_clear(const char *chat_id)
 {
+    if (!s_session_lock) return ESP_FAIL;
+    xSemaphoreTake(s_session_lock, portMAX_DELAY);
+
     char path[128];
     session_path(chat_id, path, sizeof(path));
 
     if (remove(path) == 0) {
         ESP_LOGI(TAG, "Session %s cleared", chat_id);
+        xSemaphoreGive(s_session_lock);
         return ESP_OK;
     }
+    xSemaphoreGive(s_session_lock);
     return ESP_ERR_NOT_FOUND;
 }
 

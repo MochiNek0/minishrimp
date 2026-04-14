@@ -244,14 +244,14 @@ static void agent_loop_task(void *arg)
 
         /* 2. Semantic Routing */
         float msg_vec[SUBJECT_VEC_DIM];
-        char topic_id[64];
-        if (subject_router_classify(msg.content, msg_vec) == ESP_OK) {
+        char topic_id[128];
+        char summary[64] = {0};
+        if (subject_router_classify(msg.content, msg_vec, summary, sizeof(summary)) == ESP_OK) {
             subject_router_find_target(msg.chat_id, msg_vec, topic_id, sizeof(topic_id));
         } else {
-            /* Fallback to simple chat_id if classification fails */
-            strncpy(topic_id, msg.chat_id, sizeof(topic_id) - 1);
-            topic_id[sizeof(topic_id) - 1] = '\0';
-            ESP_LOGW(TAG, "Classification failed, fallback to chat_id session");
+            /* Fallback to user-specific general session if classification fails */
+            snprintf(topic_id, sizeof(topic_id), "%s_general", msg.chat_id);
+            ESP_LOGW(TAG, "Classification failed, fallback to general session: %s", topic_id);
         }
 
         /* 3. Build turn-specific context and inject topic info */
@@ -402,8 +402,8 @@ static void agent_loop_task(void *arg)
             esp_err_t save_user = session_append(topic_id, "user", msg.content);
             esp_err_t save_asst = session_append(topic_id, "assistant", final_text);
             
-            /* Update topic vector */
-            subject_router_update_session(topic_id, msg_vec);
+            /* Update topic vector and summary */
+            subject_router_update_session(topic_id, msg_vec, summary);
 
             if (save_user != ESP_OK || save_asst != ESP_OK) {
                 ESP_LOGW(TAG, "Session save failed for topic %s", topic_id);

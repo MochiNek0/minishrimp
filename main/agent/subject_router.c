@@ -43,10 +43,14 @@ static void subject_router_sync_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(10000)); // Check every 10 seconds
         if (s_dirty) {
             xSemaphoreTake(s_lock, portMAX_DELAY);
-            subject_router_sync_index();
-            s_dirty = false;
+            esp_err_t err = subject_router_sync_index();
+            if (err == ESP_OK) {
+                s_dirty = false;
+                ESP_LOGI(TAG, "Background sync completed");
+            } else {
+                ESP_LOGE(TAG, "Background sync failed: %s", esp_err_to_name(err));
+            }
             xSemaphoreGive(s_lock);
-            ESP_LOGD(TAG, "Background sync completed");
         }
     }
     vTaskDelete(NULL);
@@ -66,20 +70,34 @@ esp_err_t subject_router_init(void)
 
     s_index = heap_caps_calloc(MAX_SESSIONS, sizeof(session_meta_t), MALLOC_CAP_SPIRAM);
     if (!s_index) {
+        ESP_LOGE(TAG, "Failed to allocate router index in PSRAM");
         xSemaphoreGive(s_lock);
         return ESP_ERR_NO_MEM;
     }
 
     FILE *f = fopen(INDEX_PATH, "rb");
     if (f) {
-        s_session_count = fread(s_index, sizeof(session_meta_t), MAX_SESSIONS, f);
+        router_index_header_t head;
+        if (fread(&head, sizeof(head), 1, f) == 1) {
+            if (head.magick == SUBJECT_ROUTER_MAGICK && head.version == SUBJECT_ROUTER_VERSION) {
+                s_session_count = fread(s_index, sizeof(session_meta_t), MAX_SESSIONS, f);
+                ESP_LOGI(TAG, "Loaded %d session vectors from index", s_session_count);
+            } else {
+                ESP_LOGW(TAG, "Index Magick/Version mismatch (0x%08x vs 0x%08x), skipping load", 
+                         (unsigned int)head.magick, (unsigned int)SUBJECT_ROUTER_MAGICK);
+                s_session_count = 0;
+            }
+        } else {
+            ESP_LOGW(TAG, "Index header read failed, skipping load");
+            s_session_count = 0;
+        }
         fclose(f);
-        ESP_LOGI(TAG, "Loaded %d session vectors from index", s_session_count);
     } else {
         ESP_LOGI(TAG, "No existing session index found");
     }
 
-    xTaskCreate(subject_router_sync_task, "router_sync", 3072, NULL, 3, NULL);
+    /* Increased stack from 3072 to 4096 to prevent overflow during file I/O */
+    xTaskCreate(subject_router_sync_task, "router_sync", 4096, NULL, 3, NULL);
     xSemaphoreGive(s_lock);
 
     return ESP_OK;
@@ -424,19 +442,33 @@ esp_err_t subject_router_sync_index(void)
 {
     const char *tmp_path = INDEX_PATH ".tmp";
     FILE *f = fopen(tmp_path, "wb");
-    if (!f) return ESP_FAIL;
+    if (!f) {
+        ESP_LOGE(TAG, "Cannot open %s for writing", tmp_path);
+        return ESP_FAIL;
+    }
 
-    size_t n = fwrite(s_index, sizeof(session_meta_t), s_session_count, f);
+    router_index_header_t head = {
+        .magick = SUBJECT_ROUTER_MAGICK,
+        .version = SUBJECT_ROUTER_VERSION,
+        .count = s_session_count
+    };
+
+    size_t written = 0;
+    written += fwrite(&head, sizeof(head), 1, f);
+    written += fwrite(s_index, sizeof(session_meta_t), s_session_count, f);
+
     fflush(f);
     fsync(fileno(f));
     fclose(f);
 
-    if (n != s_session_count) {
+    if (written != (s_session_count + 1)) {
+        ESP_LOGE(TAG, "Index write incomplete: %d/%d objects", (int)written, s_session_count + 1);
         unlink(tmp_path);
         return ESP_FAIL;
     }
 
     if (rename(tmp_path, INDEX_PATH) != 0) {
+        ESP_LOGE(TAG, "Failed up update index file");
         unlink(tmp_path);
         return ESP_FAIL;
     }

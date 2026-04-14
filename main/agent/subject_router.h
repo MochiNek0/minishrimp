@@ -5,6 +5,15 @@
 #include <time.h>
 
 #define SUBJECT_VEC_DIM 64
+#define SUBJECT_ROUTER_MAGICK 0x5348524D // "SHRM"
+#define SUBJECT_ROUTER_VERSION 1
+
+typedef struct {
+    uint32_t magick;
+    uint32_t version;
+    uint32_t count;
+    uint32_t reserved[5];
+} router_index_header_t;
 
 typedef struct {
     char session_id[33]; // Based on fnv1a_64 hex (16 chars) + "s_" + ".jsonl"

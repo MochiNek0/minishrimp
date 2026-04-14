@@ -43,7 +43,7 @@ esp_err_t session_mgr_init(void)
     if (s_session_lock == NULL) {
         s_session_lock = xSemaphoreCreateRecursiveMutex();
     }
-    ESP_LOGI(TAG, "Session manager initialized at %s", SHRIMP_SPIFFS_SESSION_DIR);
+    ESP_LOGI(TAG, "Session manager initialized at %s", SHRIMP_SPIFFS_BASE);
     return ESP_OK;
 }
 

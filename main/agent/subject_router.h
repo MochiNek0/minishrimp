@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <time.h>
 
-#define SUBJECT_VEC_DIM 32
+#define SUBJECT_VEC_DIM 64
 
 typedef struct {
     char session_id[33]; // Based on fnv1a_64 hex (16 chars) + "s_" + ".jsonl"

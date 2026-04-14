@@ -24,12 +24,16 @@ static SemaphoreHandle_t s_lock = NULL;
 static bool s_dirty = false;
 static bool s_task_running = false;
 
-/* The 32 Subject Dimensions */
+/* The 64 Subject Dimensions */
 static const char *SUBJECT_NAMES[SUBJECT_VEC_DIM] = {
-    "Daily Life", "Schedule", "Weather", "Travel", "Food", "Health", "Finance", "Shopping",
-    "Programming", "Hardware", "Math", "Science", "History", "Arts", "Music", "Sports",
-    "Emotions", "Language", "Search", "Files", "Automation", "News", "Education", "Business",
-    "Legal", "Philosophy", "Technology", "Humor", "Social", "Security", "Profile", "Planning"
+    "Daily Routine", "Household & Family", "Physical Health", "Food & Dining", "Personal Finance", "Shopping & Goods", "Travel & Geography", "Weather & Nature",
+    "Career & Business", "Productivity Tools", "Education", "Science & Math", "Consumer Tech", "Software Dev", "Hardware & Electronics", "Engineering",
+    "News & Events", "Politics & Society", "History & Culture", "Philosophy & Ethics", "Literature & Writing", "Movies & TV", "Music & Audio", "Arts & Photography",
+    "Emotions & Mental Health", "Humor & Entertainment", "Socializing & Chat", "Pets & Animals", "Fashion & Style", "Sports & Fitness", "Video Games", "Hobbies & DIY",
+    "Web Search & Facts", "File Management", "Home Automation", "Scheduling & Alarms", "Navigation & Maps", "Communication", "Languages", "Measurements",
+    "Space & Astronomy", "AI & Robotics", "Ecology & Environment", "Economics & Markets", "Psychology", "Sociology", "Legal & Rights", "Security & Privacy",
+    "Information Request", "Task Commands", "Personal Opinions", "Problem Reports", "Logic & Reasoning", "Creative Narrative", "Debate & Argument", "Appreciation",
+    "User Identity", "Assistant Persona", "Abstract Dreams", "Future Planning", "Logistics & Shipping", "Marketing & Business", "Emergency & Urgent", "General Knowledge"
 };
 
 static void subject_router_sync_task(void *arg)
@@ -100,20 +104,27 @@ esp_err_t subject_router_classify(const char *content, float *out_vec, char *out
     /* Define classification tool */
     const char *tools_json = "[{"
         "\"name\": \"set_topic_attributes\","
-        "\"description\": \"Determine the 32D semantic vector and summary for a message\","
+        "\"description\": \"Identify the top 5 most relevant subject categories and a summary\","
         "\"input_schema\": {"
             "\"type\": \"object\","
             "\"properties\": {"
-                "\"vector\": {\"type\": \"array\", \"items\": {\"type\": \"number\"}, \"minItems\": 32, \"maxItems\": 32},"
-                "\"summary\": {\"type\": \"string\"}"
+                "\"indices\": {"
+                    "\"type\": \"array\", "
+                    "\"items\": {\"type\": \"integer\", \"minimum\": 1, \"maximum\": 64}, "
+                    "\"minItems\": 5, \"maxItems\": 5, "
+                    "\"description\": \"Indices of the 5 most relevant subjects (1-64)\""
+                "},"
+                "\"summary\": {\"type\": \"string\", \"description\": \"10-word summary of the topic\"}"
             "},"
-            "\"required\": [\"vector\", \"summary\"]"
+            "\"required\": [\"indices\", \"summary\"]"
         "}"
     "}]";
 
     snprintf(prompt, 4096,
-        "Classify the user message into 32 dimensions (0.0-1.0) and provide a 10-word summary. "
-        "Subjects: %s",
+        "Classify the user message by picking the EXACTLY 5 most relevant subject indices (1-64) in descending order of relevance. "
+        "Also provide a 10-word summary. "
+        "IMPORTANT: You MUST return your response as a JSON object: {\"indices\": [rank1, rank2, rank3, rank4, rank5], \"summary\": \"...\"}\n"
+        "Subjects:\n%s",
         subject_list);
 
     cJSON *messages = cJSON_CreateArray();
@@ -148,17 +159,21 @@ esp_err_t subject_router_classify(const char *content, float *out_vec, char *out
 
     bool success = false;
     float sum_sq = 0;
+    memset(out_vec, 0, sizeof(float) * SUBJECT_VEC_DIM);
 
     if (root) {
-        cJSON *vec_arr = cJSON_GetObjectItem(root, "vector");
-        if (vec_arr && cJSON_IsArray(vec_arr) && cJSON_GetArraySize(vec_arr) == SUBJECT_VEC_DIM) {
-            for (int i = 0; i < SUBJECT_VEC_DIM; i++) {
-                cJSON *item = cJSON_GetArrayItem(vec_arr, i);
-                float val = (float)(item ? item->valuedouble : 0.0);
-                if (val < 0) val = 0;
-                if (val > 1) val = 1;
-                out_vec[i] = val;
-                sum_sq += val * val;
+        cJSON *idx_arr = cJSON_GetObjectItem(root, "indices");
+        if (idx_arr && cJSON_IsArray(idx_arr) && cJSON_GetArraySize(idx_arr) == 5) {
+            const float weights[] = {1.0f, 0.8f, 0.6f, 0.4f, 0.2f};
+            for (int i = 0; i < 5; i++) {
+                cJSON *item = cJSON_GetArrayItem(idx_arr, i);
+                if (item && cJSON_IsNumber(item)) {
+                    int idx = item->valueint - 1; // 1-64 to 0-63
+                    if (idx >= 0 && idx < SUBJECT_VEC_DIM) {
+                        out_vec[idx] = weights[i];
+                        sum_sq += out_vec[idx] * out_vec[idx];
+                    }
+                }
             }
             success = true;
         }
@@ -178,9 +193,9 @@ esp_err_t subject_router_classify(const char *content, float *out_vec, char *out
         cJSON_Delete(root);
     }
 
-    /* Fallback: Heuristic Scan for vector and Summary if JSON parsing failed */
+    /* Fallback: Heuristic Scan for indices and Summary if JSON parsing failed */
     if (!success) {
-        ESP_LOGW(TAG, "JSON parse failed for vector, attempting heuristic scan and manual summary extraction...");
+        ESP_LOGW(TAG, "JSON parse failed, attempting heuristic scan for top indices...");
         
         /* Attempt to extract summary from raw text if JSON failed */
         if (out_summary && summary_size > 0) {
@@ -205,20 +220,22 @@ esp_err_t subject_router_classify(const char *content, float *out_vec, char *out
 
         int count = 0;
         const char *p = (json_ptr ? json_ptr : resp.text);
-        while (p && *p && count < SUBJECT_VEC_DIM) {
-            while (*p && !((*p >= '0' && *p <= '9') || *p == '.' || *p == '-')) p++;
+        const float weights[] = {1.0f, 0.8f, 0.6f, 0.4f, 0.2f};
+        
+        while (p && *p && count < 5) {
+            while (*p && !(*p >= '0' && *p <= '9')) p++;
             if (!*p) break;
             char *endptr;
-            float val = strtof(p, &endptr);
+            int idx = (int)strtol(p, &endptr, 10) - 1;
             if (p != endptr) {
-                if (val >= 0.0f && val <= 1.5f) {
-                    out_vec[count++] = (val > 1.0f) ? 1.0f : val;
-                    sum_sq += out_vec[count-1] * out_vec[count-1];
+                if (idx >= 0 && idx < SUBJECT_VEC_DIM) {
+                    out_vec[idx] = weights[count++];
+                    sum_sq += out_vec[idx] * out_vec[idx];
                 }
                 p = endptr;
             } else p++;
         }
-        if (count == SUBJECT_VEC_DIM) success = true;
+        if (count > 0) success = true;
     }
 
     llm_response_free(&resp);

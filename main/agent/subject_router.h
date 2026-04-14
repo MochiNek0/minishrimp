@@ -28,7 +28,7 @@ typedef struct {
 esp_err_t subject_router_init(void);
 
 /**
- * Classify a user message into a 32-dimensional semantic vector and a short summary.
+ * Classify a user message into a 64-dimensional semantic vector and a short summary.
  * Uses the main LLM with a specialized prompt.
  */
 esp_err_t subject_router_classify(const char *content, float *out_vec, char *out_summary, size_t summary_size);

@@ -214,7 +214,8 @@ static void agent_loop_task(void *arg)
                     /* Same user — append content with newline */
                     size_t old_len = strlen(msg.content);
                     size_t add_len = strlen(extra.content);
-                    char *merged = realloc(msg.content, old_len + 1 + add_len + 1);
+                    char *old_content = msg.content;
+                    char *merged = realloc(old_content, old_len + 1 + add_len + 1);
                     if (merged) {
                         merged[old_len] = '\n';
                         memcpy(merged + old_len + 1, extra.content, add_len + 1);
@@ -243,7 +244,7 @@ static void agent_loop_task(void *arg)
         context_build_system_prompt(system_prompt, SHRIMP_CONTEXT_BUF_SIZE);
 
         /* 2. Semantic Routing */
-        float msg_vec[SUBJECT_VEC_DIM];
+        float msg_vec[SUBJECT_VEC_DIM] = {0};
         char topic_id[128];
         char summary[64] = {0};
         if (subject_router_classify(msg.content, msg_vec, summary, sizeof(summary)) == ESP_OK) {

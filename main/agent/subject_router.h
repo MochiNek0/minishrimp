@@ -4,11 +4,21 @@
 #include <stdint.h>
 #include <time.h>
 
-#define SUBJECT_VEC_DIM 32
+#define SUBJECT_VEC_DIM 64
+#define SUBJECT_ROUTER_MAGICK 0x5348524D // "SHRM"
+#define SUBJECT_ROUTER_VERSION 1
+
+typedef struct {
+    uint32_t magick;
+    uint32_t version;
+    uint32_t count;
+    uint32_t reserved[5];
+} router_index_header_t;
 
 typedef struct {
     char session_id[33]; // Based on fnv1a_64 hex (16 chars) + "s_" + ".jsonl"
     float vector[SUBJECT_VEC_DIM];
+    char summary[64];    // Short 10-word summary of the topic
     time_t last_updated;
 } session_meta_t;
 
@@ -18,10 +28,10 @@ typedef struct {
 esp_err_t subject_router_init(void);
 
 /**
- * Classify a user message into a 32-dimensional semantic vector.
+ * Classify a user message into a 64-dimensional semantic vector and a short summary.
  * Uses the main LLM with a specialized prompt.
  */
-esp_err_t subject_router_classify(const char *content, float *out_vec);
+esp_err_t subject_router_classify(const char *content, float *out_vec, char *out_summary, size_t summary_size);
 
 /**
  * Find the most relevant session for a new message.
@@ -35,9 +45,9 @@ esp_err_t subject_router_find_target(const char *chat_id, const float *msg_vec,
                                      char *out_session_id, size_t size);
 
 /**
- * Update the vector of an existing session (Average Update).
+ * Update the vector and summary of an existing session.
  */
-esp_err_t subject_router_update_session(const char *session_id, const float *msg_vec);
+esp_err_t subject_router_update_session(const char *session_id, const float *msg_vec, const char *summary);
 
 /**
  * Clear all topics and session files associated with a specific user.

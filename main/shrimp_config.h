@@ -131,7 +131,14 @@
 #define SHRIMP_USER_FILE               SHRIMP_SPIFFS_CONFIG_DIR "/USER.md"
 #define SHRIMP_CONTEXT_BUF_SIZE        (16 * 1024)
 #define SHRIMP_SESSION_MAX_MSGS        20
+#define SHRIMP_SESSION_TRIM_MARGIN     10           /* Allow session to grow slightly to reduce Flash re-writes */
 #define SHRIMP_SESSION_MAX_FILE_SIZE   (50 * 1024)  /* 50KB max per session file */
+
+/* Memory Router Optimization */
+#define SHRIMP_ROUTER_LEARNING_RATE     0.1f         /* ALPHA: how much new info affects topic vector */
+#define SHRIMP_ROUTER_MATCH_THRESHOLD   0.6f         /* Similarity score threshold to match session */
+#define SHRIMP_ROUTER_BOOST_INITIAL     0.3f         /* Initial time-based boost */
+#define SHRIMP_ROUTER_BOOST_TAU         1800         /* Time constant (seconds) for boost decay (30 mins) */
 
 /* Cron / Heartbeat */
 #define SHRIMP_CRON_FILE               SHRIMP_SPIFFS_BASE "/cron.json"

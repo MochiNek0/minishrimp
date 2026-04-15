@@ -2,10 +2,10 @@
 #include "shrimp_config.h"
 #include "tools/tool_web_search.h"
 #include "tools/tool_web_fetch.h"
-#include "tools/tool_get_time.h"
 #include "tools/tool_files.h"
 #include "tools/tool_cron.h"
 #include "tools/tool_weather.h"
+#include "tools/tool_calendar.h"
 
 #include <string.h>
 #include "esp_log.h"
@@ -82,18 +82,6 @@ esp_err_t tool_registry_init(void)
         .execute = tool_web_fetch_execute,
     };
     register_tool(&wfe);
-
-    /* Register get_current_time */
-    shrimp_tool_t gt = {
-        .name = "get_current_time",
-        .description = "Get the current date and time. Also sets the system clock. Call this when you need to know what time or date it is.",
-        .input_schema_json =
-            "{\"type\":\"object\","
-            "\"properties\":{},"
-            "\"required\":[]}",
-        .execute = tool_get_time_execute,
-    };
-    register_tool(&gt);
 
     /* Register read_file */
     shrimp_tool_t rf = {
@@ -213,6 +201,23 @@ esp_err_t tool_registry_init(void)
         .execute = tool_weather_execute,
     };
     register_tool(&gw);
+
+    /* Register get_calendar */
+    tool_calendar_init();
+    shrimp_tool_t gc = {
+        .name = "get_calendar",
+        .description = "Get a text-based calendar grid for a specific month and year. "
+        "Use this for date-related queries beyond the immediate future or to confirm weekdays for any date.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{"
+            "\"year\":{\"type\":\"integer\",\"description\":\"The year (e.g., 2026)\"},"
+            "\"month\":{\"type\":\"integer\",\"description\":\"The month (1-12)\"}"
+            "},"
+            "\"required\":[]}",
+        .execute = tool_calendar_execute,
+    };
+    register_tool(&gc);
 
     build_tools_json();
 

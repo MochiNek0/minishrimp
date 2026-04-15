@@ -134,8 +134,7 @@ I (xxx) shrimp: All services started!
 1. Open Telegram, find your bot (the one you created with BotFather)
 2. Send: `Hello`
 3. You should see "shrimp is working..." followed by a response
-4. Send: `What time is it?` — tests the get_current_time tool
-5. Send: `Search for latest news about ESP32` — tests web_search (if Brave key set)
+4. Send: `Search for latest news about ESP32` — tests web_search (if Brave key set)
 
 ## Post-Deploy: Runtime Configuration
 

@@ -35,6 +35,32 @@ static bool get_current_time_str(char *buf, size_t size)
     return true;
 }
 
+static void build_reference_calendar(char *buf, size_t size)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    time_t now = tv.tv_sec;
+    struct tm tm_info;
+    localtime_r(&now, &tm_info);
+
+    if (tm_info.tm_year + 1900 < 2020) {
+        buf[0] = '\0';
+        return;
+    }
+
+    size_t off = 0;
+    off += snprintf(buf + off, size - off, "## Reference Calendar (Quick Look)\n");
+    
+    for (int i = 0; i < 7; i++) {
+        time_t day = now + i * 86400;
+        struct tm tm_day;
+        localtime_r(&day, &tm_day);
+        char date_str[32];
+        strftime(date_str, sizeof(date_str), "%Y-%m-%d (%A)", &tm_day);
+        off += snprintf(buf + off, size - off, "- %s%s\n", date_str, (i == 0) ? " [Today]" : "");
+    }
+}
+
 static size_t append_file(char *buf, size_t size, size_t offset, const char *path, const char *header)
 {
     FILE *f = fopen(path, "r");
@@ -75,11 +101,6 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
         "Be helpful, accurate, and concise.\n\n",
         time_str, llm_get_model(), llm_get_provider());
 
-    if (!time_valid) {
-        off += snprintf(buf + off, size - off,
-            "Note: System clock may not be synchronized. Use get_current_time tool for accurate time.\n\n");
-    }
-
     off += snprintf(buf + off, size - off,
         "## Available Tools\n"
         "You have access to the following tools:\n"
@@ -87,8 +108,6 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
         "Use this when you need up-to-date facts, news, or anything beyond your training data.\n"
         "- web_fetch: Fetch and extract text content from a web page URL. "
         "Use this when the user shares a link and wants you to read, summarize, or analyze the page content.\n"
-        "- get_current_time: Get the current date and time. "
-        "Use this when you need precise time or the system clock appears unsynchronized.\n"
         "- get_weather: Get current weather or forecast for a city. "
         "Use this when the user asks about the weather. "
         "Optional: provide start_date and end_date (YYYY-MM-DD) for multi-day forecast.\n"
@@ -98,7 +117,8 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
         "- list_dir: List files, optionally filter by prefix.\n"
         "- cron_add: Schedule a recurring or one-shot task. The message will trigger an agent turn when the job fires.\n"
         "- cron_list: List all scheduled cron jobs.\n"
-        "- cron_remove: Remove a scheduled cron job by ID.\n\n"
+        "- cron_remove: Remove a scheduled cron job by ID.\n"
+        "- get_calendar: Get a text-based calendar grid for a specific month and year. Use this for planning or confirming future/past dates.\n\n"
         "When using cron_add for Feishu delivery, always set channel='feishu' and a valid open_id as chat_id.\n\n"
         "Use tools when needed. Provide your final answer as text after using tools.\n\n"
         "## Memory\n"
@@ -109,7 +129,6 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
         "- When you learn something new about the user (name, preferences, habits, context), write it to MEMORY.md.\n"
         "- When something noteworthy happens in a conversation, append it to today's daily note.\n"
         "- Always read_file MEMORY.md before writing, so you can edit_file to update without losing existing content.\n"
-        "- Use get_current_time to know today's date before writing daily notes.\n"
         "- Keep MEMORY.md concise and organized — summarize, don't dump raw conversation.\n"
         "- You should proactively save memory without being asked. If the user tells you their name, preferences, or important facts, persist them immediately.\n\n"
         "## Skills\n"
@@ -123,6 +142,13 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
         "2. Use edit_file to update the relevant fields\n"
         "3. For timezone: infer the IANA timezone (e.g. Asia/Shanghai) from the user's city/country\n"
         "4. Confirm the update to the user\n");
+
+    /* Current Calendar Context */
+    char cal_buf[512];
+    build_reference_calendar(cal_buf, sizeof(cal_buf));
+    if (cal_buf[0]) {
+        off += snprintf(buf + off, size - off, "\n%s\n", cal_buf);
+    }
 
     /* Bootstrap files */
     off = append_file(buf, size, off, SHRIMP_SOUL_FILE, "Personality");

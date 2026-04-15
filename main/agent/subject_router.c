@@ -26,14 +26,14 @@ static bool s_task_running = false;
 
 /* The 64 Subject Dimensions */
 static const char *SUBJECT_NAMES[SUBJECT_VEC_DIM] = {
-    "Daily Routine", "Household & Family", "Physical Health", "Food & Dining", "Personal Finance", "Shopping & Goods", "Travel & Geography", "Weather & Nature",
-    "Career & Business", "Productivity Tools", "Education", "Science & Math", "Consumer Tech", "Software Dev", "Hardware & Electronics", "Engineering",
-    "News & Events", "Politics & Society", "History & Culture", "Philosophy & Ethics", "Literature & Writing", "Movies & TV", "Music & Audio", "Arts & Photography",
-    "Emotions & Mental Health", "Humor & Entertainment", "Socializing & Chat", "Pets & Animals", "Fashion & Style", "Sports & Fitness", "Video Games", "Hobbies & DIY",
-    "Web Search & Facts", "File Management", "Home Automation", "Scheduling & Alarms", "Navigation & Maps", "Communication", "Languages", "Measurements",
-    "Space & Astronomy", "AI & Robotics", "Ecology & Environment", "Economics & Markets", "Psychology", "Sociology", "Legal & Rights", "Security & Privacy",
-    "Information Request", "Task Commands", "Personal Opinions", "Problem Reports", "Logic & Reasoning", "Creative Narrative", "Debate & Argument", "Appreciation",
-    "User Identity", "Assistant Persona", "Abstract Dreams", "Future Planning", "Logistics & Shipping", "Marketing & Business", "Emergency & Urgent", "General Knowledge"
+"Daily Routines", "Household Management", "Parenting & Family", "Elderly Care", "Personal Finance", "Real Estate", "Culinary Arts", "Nutrition & Diet",
+  "Physical Medicine", "Mental Health", "Pharmacology", "Fitness & Bodybuilding", "Competitive Sports", "Outdoor Adventures", "Pets & Zoology", "Gardening & Botany",
+  "Theoretical Mathematics", "Physics & Chemistry", "Biology & Genetics", "Earth Sciences", "Space & Astronomy", "Ecology & Environment", "Micro-Electronics", "Mechanical Engineering",
+  "Software Engineering", "Artificial Intelligence", "Cybersecurity", "Data Science", "Consumer Electronics", "Internet of Things", "Automotive Tech", "Aerospace Tech",
+  "Macroeconomics", "Financial Markets", "Corporate Management", "Marketing & Branding", "E-commerce & Retail", "Logistics & Supply Chain", "Career Planning", "Industrial Design",
+  "World History", "Archeology", "Political Science", "Jurisprudence & Law", "Sociology", "Cultural Anthropology", "Linguistics", "Philosophy & Logic",
+  "Classic Literature", "Creative Writing", "Journalism & News", "Cinematography", "Music Theory & Audio", "Visual Arts & Painting", "Photography & Video", "Performing Arts",
+  "Fashion & Textile", "Architecture & Interior", "Travel & Tourism", "Navigation & Cartography", "Video Games & Esports", "Handicrafts & DIY", "Board Games & Puzzles", "Mythology & Folklore"
 };
 
 static void subject_router_sync_task(void *arg)
@@ -138,12 +138,20 @@ esp_err_t subject_router_classify(const char *content, float *out_vec, char *out
         "}"
     "}]";
 
+    /* Get current time for temporal context */
+    time_t now = time(NULL);
+    struct tm tm_info;
+    localtime_r(&now, &tm_info);
+    char time_str[64];
+    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S (%A)", &tm_info);
+
     snprintf(prompt, 4096,
+        "Current Time: %s\n\n"
         "Classify the user message by picking the EXACTLY 5 most relevant subject indices (1-64) in descending order of relevance. "
         "Also provide a 10-word summary. "
         "IMPORTANT: You MUST return your response as a JSON object: {\"indices\": [rank1, rank2, rank3, rank4, rank5], \"summary\": \"...\"}\n"
         "Subjects:\n%s",
-        subject_list);
+        time_str, subject_list);
 
     cJSON *messages = cJSON_CreateArray();
     cJSON *msg = cJSON_CreateObject();
@@ -467,8 +475,9 @@ esp_err_t subject_router_sync_index(void)
         return ESP_FAIL;
     }
 
+    unlink(INDEX_PATH);
     if (rename(tmp_path, INDEX_PATH) != 0) {
-        ESP_LOGE(TAG, "Failed up update index file");
+        ESP_LOGE(TAG, "Failed to update index file");
         unlink(tmp_path);
         return ESP_FAIL;
     }

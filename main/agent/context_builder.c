@@ -83,7 +83,7 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
 
     /* Inject current time from system clock */
     char time_str[64];
-    bool time_valid = get_current_time_str(time_str, sizeof(time_str));
+    (void)get_current_time_str(time_str, sizeof(time_str));
 
     off += snprintf(buf + off, size - off,
         "# MiniShrimp (小虾米)\n\n"

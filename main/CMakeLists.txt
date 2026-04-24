@@ -23,6 +23,7 @@ idf_component_register(
         "tools/tool_files.c"
         "tools/tool_weather.c"
         "tools/tool_calendar.c"
+        "tools/tool_api.c"
         "skills/skill_loader.c"
         "utils/string_utils.c"
         "utils/json_utils.c"

@@ -6,8 +6,6 @@
 #include "cJSON.h"
 #include "esp_log.h"
 
-static const char *TAG = "tool_calendar";
-
 static const char *MONTH_NAMES[] = {
     "January", "February", "March", "April", "May", "June",
     "July", "August", "September", "October", "November", "December"

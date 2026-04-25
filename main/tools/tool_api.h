@@ -7,7 +7,8 @@
  * Execute a generic API call.
  *
  * @param input_json   JSON string with fields: endpoint (required), method (optional),
- *                     token (optional, Bearer token), body (optional, for POST/PUT)
+ *                     token (optional, Bearer token), body (optional, for POST/PUT).
+ *                     body may be either a JSON string (already serialized) or a JSON object/array.
  * @param output       Output buffer for response body
  * @param output_size  Size of output buffer
  * @return ESP_OK on success

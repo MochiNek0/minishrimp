@@ -229,12 +229,12 @@ esp_err_t tool_registry_init(void)
         .input_schema_json =
             "{\"type\":\"object\","
             "\"properties\":{"
-            "\"endpoint\":{\"type\":\"string\",\"description\":\"Full URL of the API endpoint (e.g. https://api.example.com/data)\"},"
-            "\"method\":{\"type\":\"string\",\"description\":\"HTTP method: GET, POST, PUT, or DELETE (default: GET)\"},"
-            "\"token\":{\"type\":\"string\",\"description\":\"Optional Bearer token for authentication\"},"
-            "\"body\":{\"type\":\"string\",\"description\":\"Request body for POST/PUT requests (JSON string)\"}"
-            "},"
-            "\"required\":[\"endpoint\"]}",
+             "\"endpoint\":{\"type\":\"string\",\"description\":\"Full URL of the API endpoint (e.g. https://api.example.com/data)\"},"
+             "\"method\":{\"type\":\"string\",\"description\":\"HTTP method: GET, POST, PUT, or DELETE (default: GET)\"},"
+             "\"token\":{\"type\":\"string\",\"description\":\"Optional Bearer token for authentication\"},"
+            "\"body\":{\"description\":\"Request body for POST/PUT requests (JSON string or object)\",\"type\":[\"string\",\"object\",\"array\"]}"
+             "},"
+             "\"required\":[\"endpoint\"]}",
         .execute = tool_api_call_execute,
     };
     register_tool(&ac);

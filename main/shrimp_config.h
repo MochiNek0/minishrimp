@@ -87,7 +87,10 @@
 #define SHRIMP_AGENT_MAX_TOOL_ITER     10
 #define SHRIMP_MAX_TOOL_CALLS          4
 #define SHRIMP_AGENT_SEND_WORKING_STATUS 1
-#define SHRIMP_AGENT_DEBOUNCE_MS       15000
+#define SHRIMP_AGENT_DEBOUNCE_MS       0
+#define SHRIMP_AGENT_TEXT_DEBOUNCE_MS  2500
+#define SHRIMP_AGENT_IMAGE_DEBOUNCE_MS 12000
+#define SHRIMP_AGENT_DEBOUNCE_MAX_MS   15000
 
 /* Timezone (POSIX TZ format) - China Standard Time (UTC+8) */
 #define SHRIMP_TIMEZONE                "CST-8"
@@ -139,6 +142,9 @@
 #define SHRIMP_ROUTER_MATCH_THRESHOLD   0.6f         /* Similarity score threshold to match session */
 #define SHRIMP_ROUTER_BOOST_INITIAL     0.3f         /* Initial time-based boost */
 #define SHRIMP_ROUTER_BOOST_TAU         1800         /* Time constant (seconds) for boost decay (30 mins) */
+#define SHRIMP_ROUTER_ACTIVE_TTL_SEC    1800         /* Active topic can resolve follow-ups for 30 mins */
+#define SHRIMP_ROUTER_CONTINUE_THRESHOLD 0.42f       /* Similarity needed to continue the active topic */
+#define SHRIMP_ROUTER_SHIFT_MARGIN      0.18f        /* New topic must beat active by this margin */
 
 /* Cron / Heartbeat */
 #define SHRIMP_CRON_FILE               SHRIMP_SPIFFS_BASE "/cron.json"

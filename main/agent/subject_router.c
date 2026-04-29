@@ -17,9 +17,18 @@ static const char *TAG = "router";
 
 #define INDEX_PATH SHRIMP_SPIFFS_SESSION_DIR "/sessions_idx.bin"
 #define MAX_SESSIONS 100
+#define MAX_ACTIVE_TOPICS 16
+
+typedef struct {
+    char chat_id[64];
+    char session_id[33];
+    time_t last_active;
+    bool in_use;
+} active_topic_t;
 
 static session_meta_t *s_index = NULL;
 static int s_session_count = 0;
+static active_topic_t s_active_topics[MAX_ACTIVE_TOPICS];
 static SemaphoreHandle_t s_lock = NULL;
 static bool s_dirty = false;
 static bool s_task_running = false;
@@ -291,6 +300,92 @@ static float cosine_similarity(const float *v1, const float *v2)
     return dot / (sqrtf(m1) * sqrtf(m2));
 }
 
+static bool contains_any(const char *s, const char *const *needles, size_t count)
+{
+    if (!s) return false;
+    for (size_t i = 0; i < count; i++) {
+        if (strstr(s, needles[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool message_is_context_dependent(const char *content)
+{
+    static const char *const patterns[] = {
+        "这个", "那个", "这些", "那些", "它", "他们", "她们", "它们",
+        "刚才", "上面", "前面", "之前", "这里", "这条", "这句话",
+        "这些信息", "这个信息", "这个问题", "那个问题",
+        "调用了什么工具", "用了什么工具", "什么工具", "怎么拿到", "怎么获取",
+        "this", "that", "these", "those", "it", "they", "above", "previous",
+        "earlier", "same", "which tool", "what tool"
+    };
+    return contains_any(content, patterns, sizeof(patterns) / sizeof(patterns[0]));
+}
+
+static bool message_is_explicit_topic_shift(const char *content)
+{
+    static const char *const patterns[] = {
+        "换个话题", "换一个话题", "另一个话题", "新话题", "新问题",
+        "说完了", "先不说", "先不聊", "不聊这个", "回到正题",
+        "另外一个", "还有一个问题", "再问一个",
+        "new topic", "different topic", "another topic", "new question",
+        "separate question", "forget that", "ignore that"
+    };
+    return contains_any(content, patterns, sizeof(patterns) / sizeof(patterns[0]));
+}
+
+static int find_session_index_locked(const char *session_id)
+{
+    if (!session_id) return -1;
+    for (int i = 0; i < s_session_count; i++) {
+        if (strcmp(s_index[i].session_id, session_id) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int find_active_topic_locked(const char *chat_id)
+{
+    if (!chat_id) return -1;
+    for (int i = 0; i < MAX_ACTIVE_TOPICS; i++) {
+        if (s_active_topics[i].in_use && strcmp(s_active_topics[i].chat_id, chat_id) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void set_active_topic_locked(const char *chat_id, const char *session_id, time_t now)
+{
+    if (!chat_id || !session_id) return;
+
+    int idx = find_active_topic_locked(chat_id);
+    if (idx < 0) {
+        time_t oldest = now;
+        idx = 0;
+        for (int i = 0; i < MAX_ACTIVE_TOPICS; i++) {
+            if (!s_active_topics[i].in_use) {
+                idx = i;
+                break;
+            }
+            if (s_active_topics[i].last_active <= oldest) {
+                oldest = s_active_topics[i].last_active;
+                idx = i;
+            }
+        }
+    }
+
+    strncpy(s_active_topics[idx].chat_id, chat_id, sizeof(s_active_topics[idx].chat_id) - 1);
+    s_active_topics[idx].chat_id[sizeof(s_active_topics[idx].chat_id) - 1] = '\0';
+    strncpy(s_active_topics[idx].session_id, session_id, sizeof(s_active_topics[idx].session_id) - 1);
+    s_active_topics[idx].session_id[sizeof(s_active_topics[idx].session_id) - 1] = '\0';
+    s_active_topics[idx].last_active = now;
+    s_active_topics[idx].in_use = true;
+}
+
 /* FNV-1a 64-bit for internal use */
 static uint64_t fnv1a_64(const char *s)
 {
@@ -305,20 +400,49 @@ static uint64_t fnv1a_64(const char *s)
 esp_err_t subject_router_find_target(const char *chat_id, const float *msg_vec, 
                                      char *out_session_id, size_t size)
 {
+    return subject_router_find_target_for_message(chat_id, NULL, msg_vec, out_session_id, size, NULL);
+}
+
+esp_err_t subject_router_find_target_for_message(const char *chat_id, const char *content,
+                                                 const float *msg_vec,
+                                                 char *out_session_id, size_t size,
+                                                 subject_route_info_t *out_info)
+{
     if (!s_lock || !s_index || !chat_id || !msg_vec || !out_session_id) return ESP_ERR_INVALID_ARG;
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
 
     time_t now = time(NULL);
     float best_score = -1.0f;
+    float active_similarity = 0.0f;
+    float active_score = 0.0f;
     int best_idx = -1;
+    int active_session_idx = -1;
+    bool context_dependent = message_is_context_dependent(content);
+    bool explicit_shift = message_is_explicit_topic_shift(content);
     uint64_t chat_h = fnv1a_64(chat_id);
     char chat_prefix[9];
     snprintf(chat_prefix, sizeof(chat_prefix), "%08llx", (unsigned long long)(chat_h & 0xFFFFFFFF));
 
+    int active_idx = find_active_topic_locked(chat_id);
+    bool active_is_recent = false;
+    if (active_idx >= 0) {
+        active_session_idx = find_session_index_locked(s_active_topics[active_idx].session_id);
+        if (active_session_idx >= 0) {
+            double active_age = difftime(now, s_active_topics[active_idx].last_active);
+            active_is_recent = (active_age >= 0 && active_age <= SHRIMP_ROUTER_ACTIVE_TTL_SEC);
+            active_similarity = cosine_similarity(msg_vec, s_index[active_session_idx].vector);
+            if (active_is_recent) {
+                active_score = active_similarity +
+                    SHRIMP_ROUTER_BOOST_INITIAL * expf(-(float)active_age / SHRIMP_ROUTER_BOOST_TAU);
+            }
+        }
+    }
+
     /* Find best match among user's sessions */
     for (int i = 0; i < s_session_count; i++) {
         if (strncmp(s_index[i].session_id, chat_prefix, 8) != 0) continue;
+        if (explicit_shift && i == active_session_idx) continue;
 
         float sim = cosine_similarity(msg_vec, s_index[i].vector);
         
@@ -339,14 +463,43 @@ esp_err_t subject_router_find_target(const char *chat_id, const float *msg_vec,
         }
     }
 
+    subject_route_kind_t route_kind = SUBJECT_ROUTE_NEW;
+
+    if (!explicit_shift && active_is_recent && active_session_idx >= 0) {
+        bool active_is_best = (best_idx == active_session_idx);
+        bool best_barely_better = (best_idx >= 0 && (best_score - active_score) < SHRIMP_ROUTER_SHIFT_MARGIN);
+
+        if (context_dependent) {
+            strncpy(out_session_id, s_index[active_session_idx].session_id, size - 1);
+            out_session_id[size - 1] = '\0';
+            set_active_topic_locked(chat_id, out_session_id, now);
+            route_kind = SUBJECT_ROUTE_ACTIVE_FOLLOWUP;
+            ESP_LOGI(TAG, "Routed follow-up to active topic %s (active_sim=%.2f, best=%.2f)",
+                     out_session_id, active_similarity, best_score);
+            goto done;
+        }
+
+        if (active_similarity >= SHRIMP_ROUTER_CONTINUE_THRESHOLD &&
+            (active_is_best || best_barely_better)) {
+            strncpy(out_session_id, s_index[active_session_idx].session_id, size - 1);
+            out_session_id[size - 1] = '\0';
+            set_active_topic_locked(chat_id, out_session_id, now);
+            route_kind = SUBJECT_ROUTE_ACTIVE_CONTINUATION;
+            ESP_LOGI(TAG, "Continued active topic %s (active_sim=%.2f, best=%.2f)",
+                     out_session_id, active_similarity, best_score);
+            goto done;
+        }
+    }
+
     /* Threshold for matching from config */
     if (best_idx != -1 && best_score > SHRIMP_ROUTER_MATCH_THRESHOLD) {
         strncpy(out_session_id, s_index[best_idx].session_id, size - 1);
         out_session_id[size - 1] = '\0';
+        set_active_topic_locked(chat_id, out_session_id, now);
+        route_kind = SUBJECT_ROUTE_MATCHED;
         ESP_LOGI(TAG, "Matched to topic %s (score=%.2f): %s", 
                  out_session_id, best_score, s_index[best_idx].summary);
-        xSemaphoreGive(s_lock);
-        return ESP_OK;
+        goto done;
     }
 
     /* No match: generate a new unique session_id: <chat_h_8>_<ts> */
@@ -378,7 +531,16 @@ esp_err_t subject_router_find_target(const char *chat_id, const float *msg_vec,
            or we should pass it here. For new topics, we'll get it from classify */
         s_dirty = true;
     }
+    set_active_topic_locked(chat_id, out_session_id, now);
 
+done:
+    if (out_info) {
+        out_info->kind = route_kind;
+        out_info->best_score = best_score;
+        out_info->active_similarity = active_similarity;
+        out_info->context_dependent = context_dependent;
+        out_info->explicit_shift = explicit_shift;
+    }
     xSemaphoreGive(s_lock);
     return ESP_OK;
 }

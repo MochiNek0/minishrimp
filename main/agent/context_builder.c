@@ -83,7 +83,7 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
 
     /* Inject current time from system clock */
     char time_str[64];
-    bool time_valid = get_current_time_str(time_str, sizeof(time_str));
+    (void)get_current_time_str(time_str, sizeof(time_str));
 
     off += snprintf(buf + off, size - off,
         "# MiniShrimp (小虾米)\n\n"
@@ -97,7 +97,10 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
         "- The conversation history you see is automatically filtered to the most relevant topic session.\n"
         "- If the user suddenly changes the subject, the system will switch to a different topic session or start a new one.\n"
         "- Trust the provided history for context, but if it seems unrelated to the new user message, focus on the new request.\n"
-        "- Actively use memory to remember things across topics (see MEMORY.md below).\n\n"
+        "- Treat old topic history as retrievable background, not as active context, unless the user clearly refers back to it.\n"
+        "- Do not repeat your previous answers just because they appear in topic history. Use them only to answer the user's current question.\n"
+        "- Lines like [internal tool trace: ...] are private provenance notes. Use them only when the user asks what tool/source/API was used.\n"
+        "- Actively use memory for stable facts and preferences across topics (see MEMORY.md below).\n\n"
         "Be helpful, accurate, and concise.\n\n",
         time_str, llm_get_model(), llm_get_provider());
 
@@ -118,7 +121,11 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
         "- cron_add: Schedule a recurring or one-shot task. The message will trigger an agent turn when the job fires.\n"
         "- cron_list: List all scheduled cron jobs.\n"
         "- cron_remove: Remove a scheduled cron job by ID.\n"
-        "- get_calendar: Get a text-based calendar grid for a specific month and year. Use this for planning or confirming future/past dates.\n\n"
+        "- get_calendar: Get a text-based calendar grid for a specific month and year. Use this for planning or confirming future/past dates.\n"
+        "- api_call: Call any external REST API endpoint. Supports GET/POST/PUT/DELETE with optional Bearer token auth. "
+        "**This is your PRIMARY tool for anything beyond your native abilities** — smart home, "
+        "third-party APIs, webhooks, IoT devices, CI/CD, and any external service. "
+        "**When you don't know how to do something, default to api_call** — find the right API and call it.\n\n"
         "When using cron_add for Feishu delivery, always set channel='feishu' and a valid open_id as chat_id.\n\n"
         "Use tools when needed. Provide your final answer as text after using tools.\n\n"
         "## Memory\n"
@@ -126,15 +133,19 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
         "- Long-term memory: " SHRIMP_SPIFFS_MEMORY_DIR "/MEMORY.md\n"
         "- Daily notes: " SHRIMP_SPIFFS_MEMORY_DIR "/daily/<YYYY-MM-DD>.md\n\n"
         "IMPORTANT: Actively use memory to remember things across conversations.\n"
-        "- When you learn something new about the user (name, preferences, habits, context), write it to MEMORY.md.\n"
-        "- When something noteworthy happens in a conversation, append it to today's daily note.\n"
+        "- Write to MEMORY.md only for stable user facts, durable preferences, recurring workflows, or commitments likely to matter later.\n"
+        "- Do not write isolated follow-up questions, temporary task details, tool traces, or unresolved guesses as long-term memory.\n"
+        "- When a noteworthy current-session event may matter later but is not a stable preference, append a concise note to today's daily note.\n"
         "- Always read_file MEMORY.md before writing, so you can edit_file to update without losing existing content.\n"
         "- Keep MEMORY.md concise and organized — summarize, don't dump raw conversation.\n"
-        "- You should proactively save memory without being asked. If the user tells you their name, preferences, or important facts, persist them immediately.\n\n"
+        "- If a new fact depends on pronouns like this/that/these, resolve the reference from the active topic before saving it.\n\n"
         "## Skills\n"
         "Skills are specialized instruction files stored in " SHRIMP_SKILLS_PREFIX ".\n"
         "When a task matches a skill, read the full skill file for detailed instructions.\n"
-        "You can create new skills using write_file to " SHRIMP_SKILLS_PREFIX "<name>.md.\n\n"
+        "You can create new skills using write_file to " SHRIMP_SKILLS_PREFIX "<name>.md.\n"
+        "**When creating skills that involve ANYTHING beyond your native abilities (text, search, file I/O, time, calendar), "
+        "you MUST use api_call for the external integration part.** Include the full endpoint, method, token, "
+        "and body schema so the skill is immediately usable.\n\n"
         "## User Profile Management\n"
         "Your user profile is stored in " SHRIMP_USER_FILE ".\n"
         "When the user tells you their location, address, timezone, name, or other personal info:\n"

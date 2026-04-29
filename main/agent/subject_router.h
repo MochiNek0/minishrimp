@@ -1,12 +1,29 @@
 #pragma once
 
 #include "esp_err.h"
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <time.h>
 
 #define SUBJECT_VEC_DIM 64
 #define SUBJECT_ROUTER_MAGICK 0x5348524D // "SHRM"
 #define SUBJECT_ROUTER_VERSION 1
+
+typedef enum {
+    SUBJECT_ROUTE_NEW = 0,
+    SUBJECT_ROUTE_MATCHED,
+    SUBJECT_ROUTE_ACTIVE_FOLLOWUP,
+    SUBJECT_ROUTE_ACTIVE_CONTINUATION,
+} subject_route_kind_t;
+
+typedef struct {
+    subject_route_kind_t kind;
+    float best_score;
+    float active_similarity;
+    bool context_dependent;
+    bool explicit_shift;
+} subject_route_info_t;
 
 typedef struct {
     uint32_t magick;
@@ -43,6 +60,18 @@ esp_err_t subject_router_classify(const char *content, float *out_vec, char *out
  */
 esp_err_t subject_router_find_target(const char *chat_id, const float *msg_vec, 
                                      char *out_session_id, size_t size);
+
+/**
+ * Route a message using topic vectors plus a per-chat working context.
+ *
+ * This protects short follow-ups such as "these details" or "what tool did you
+ * use" from being routed as isolated topics, while explicit subject changes are
+ * allowed to open or match a different session.
+ */
+esp_err_t subject_router_find_target_for_message(const char *chat_id, const char *content,
+                                                 const float *msg_vec,
+                                                 char *out_session_id, size_t size,
+                                                 subject_route_info_t *out_info);
 
 /**
  * Update the vector and summary of an existing session.
